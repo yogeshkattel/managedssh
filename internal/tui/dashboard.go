@@ -103,7 +103,7 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if len(m.filtered) > 0 {
 			h := m.filtered[m.hostCursor]
-			users := h.UserList()
+			users := h.AccountNames()
 			if len(users) == 0 {
 				m.connErr = "No users configured for this host"
 				return m, nil
@@ -122,8 +122,14 @@ func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 	m.selectedHost = host.Host{}
 
 	var password []byte
-	if h.AuthType == "password" && len(h.EncPassword) > 0 {
-		dec, err := vault.Decrypt(m.encKey, h.EncPassword)
+	_, authType, encPassword, ok := h.ResolveAccount(user)
+	if !ok {
+		m.connErr = "Selected user is no longer available"
+		return m, nil
+	}
+
+	if authType == "password" && len(encPassword) > 0 {
+		dec, err := vault.Decrypt(m.encKey, encPassword)
 		if err == nil {
 			password = dec
 		}
@@ -285,7 +291,7 @@ func (m model) renderDetails() string {
 	h := m.filtered[m.hostCursor]
 
 	authLabel := "SSH Key"
-	if h.AuthType == "password" {
+	if h.DefaultAuthType == "password" {
 		authLabel = "Password"
 	}
 
@@ -296,9 +302,10 @@ func (m model) renderDetails() string {
 	lines := []string{
 		render("Alias", h.Alias),
 		render("Host", h.Hostname),
-		render("Users", strings.Join(h.UserList(), ", ")),
+		render("Users", strings.Join(h.AccountNames(), ", ")),
 		render("Port", fmt.Sprintf("%d", h.Port)),
-		render("Auth", authLabel),
+		render("Default Auth", authLabel),
+		render("Overrides", summarizeAccountOverrides(h)),
 	}
 	return strings.Join(lines, "\n")
 }
@@ -328,7 +335,7 @@ func (m model) updateUserSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	users := m.selectedHost.UserList()
+	users := m.selectedHost.AccountNames()
 	if len(users) == 0 {
 		m.phase = phaseDashboard
 		return m, nil
@@ -354,7 +361,7 @@ func (m model) updateUserSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) viewUserSelect() string {
-	users := m.selectedHost.UserList()
+	users := m.selectedHost.AccountNames()
 
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Choose SSH User") + "\n")
@@ -367,7 +374,7 @@ func (m model) viewUserSelect() string {
 			prefix = "▸ "
 			style = lipgloss.NewStyle().Foreground(highlight).Bold(true)
 		}
-		b.WriteString(style.Render(prefix + user))
+		b.WriteString(style.Render(prefix + user + userSummarySuffix(m.selectedHost, user)))
 		if i < len(users)-1 {
 			b.WriteByte('\n')
 		}
@@ -376,4 +383,36 @@ func (m model) viewUserSelect() string {
 	b.WriteString("\n\n")
 	b.WriteString(statusBarStyle.Render("↑↓ navigate • enter connect • esc back"))
 	return boxStyle.Render(b.String())
+}
+
+func summarizeAccountOverrides(h host.Host) string {
+	var parts []string
+	for _, account := range h.Accounts {
+		if account.UseDefault {
+			continue
+		}
+		label := account.Username + " (SSH Key)"
+		if account.AuthType == "password" {
+			label = account.Username + " (Password)"
+		}
+		parts = append(parts, label)
+	}
+	if len(parts) == 0 {
+		return "None"
+	}
+	return strings.Join(parts, ", ")
+}
+
+func userSummarySuffix(h host.Host, username string) string {
+	account, authType, _, ok := h.ResolveAccount(username)
+	if !ok {
+		return ""
+	}
+	if account.UseDefault {
+		return "  [default]"
+	}
+	if authType == "password" {
+		return "  [password override]"
+	}
+	return "  [key override]"
 }

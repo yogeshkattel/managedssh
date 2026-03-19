@@ -11,14 +11,26 @@ import (
 )
 
 type Host struct {
-	ID          string   `json:"id"`
-	Alias       string   `json:"alias"`
-	Hostname    string   `json:"hostname"`
+	ID                 string     `json:"id"`
+	Alias              string     `json:"alias"`
+	Hostname           string     `json:"hostname"`
+	Port               int        `json:"port"`
+	DefaultAuthType    string     `json:"default_auth_type,omitempty"`
+	DefaultEncPassword []byte     `json:"default_enc_password,omitempty"`
+	Accounts           []HostUser `json:"accounts,omitempty"`
+
+	// Legacy fields kept for backward compatibility with existing hosts.json.
 	User        string   `json:"user,omitempty"`
 	Users       []string `json:"users,omitempty"`
-	Port        int      `json:"port"`
-	AuthType    string   `json:"auth_type"`
+	AuthType    string   `json:"auth_type,omitempty"`
 	EncPassword []byte   `json:"enc_password,omitempty"`
+}
+
+type HostUser struct {
+	Username    string `json:"username"`
+	UseDefault  bool   `json:"use_default,omitempty"`
+	AuthType    string `json:"auth_type,omitempty"`
+	EncPassword []byte `json:"enc_password,omitempty"`
 }
 
 type Store struct {
@@ -117,7 +129,7 @@ func (s *Store) Filter(query string) []Host {
 	q := strings.ToLower(query)
 	var out []Host
 	for _, h := range s.Hosts {
-		users := strings.ToLower(strings.Join(h.UserList(), " "))
+		users := strings.ToLower(strings.Join(h.AccountNames(), " "))
 		if strings.Contains(strings.ToLower(h.Alias), q) ||
 			strings.Contains(strings.ToLower(h.Hostname), q) ||
 			strings.Contains(users, q) {
@@ -127,39 +139,143 @@ func (s *Store) Filter(query string) []Host {
 	return out
 }
 
-func (h Host) UserList() []string {
-	users := normalizeUsers(h.Users)
-	if len(users) > 0 {
-		return users
+func (h *Host) Normalize() {
+	if h.Port == 0 {
+		h.Port = 22
 	}
-	if h.User == "" {
+
+	defaultAuth := normalizeAuthType(h.DefaultAuthType)
+	if defaultAuth == "" {
+		defaultAuth = normalizeAuthType(h.AuthType)
+	}
+	if defaultAuth == "" {
+		defaultAuth = "key"
+	}
+	h.DefaultAuthType = defaultAuth
+
+	if len(h.DefaultEncPassword) == 0 && len(h.EncPassword) > 0 {
+		h.DefaultEncPassword = cloneBytes(h.EncPassword)
+	}
+	if h.DefaultAuthType != "password" {
+		h.DefaultEncPassword = nil
+	}
+
+	accounts := normalizeAccounts(h.Accounts)
+	if len(accounts) == 0 {
+		for _, name := range legacyAccountNames(h.User, h.Users) {
+			accounts = append(accounts, HostUser{
+				Username:   name,
+				UseDefault: true,
+			})
+		}
+	}
+	h.Accounts = accounts
+
+	names := h.AccountNames()
+	h.User = ""
+	if len(names) > 0 {
+		h.User = names[0]
+	}
+	h.Users = names
+	h.AuthType = h.DefaultAuthType
+	h.EncPassword = cloneBytes(h.DefaultEncPassword)
+}
+
+func (h Host) AccountNames() []string {
+	names := make([]string, 0, len(h.Accounts))
+	for _, account := range h.Accounts {
+		if account.Username != "" {
+			names = append(names, account.Username)
+		}
+	}
+	return names
+}
+
+func (h Host) ResolveAccount(username string) (HostUser, string, []byte, bool) {
+	for _, account := range h.Accounts {
+		if account.Username != username {
+			continue
+		}
+		if account.UseDefault {
+			return account, h.DefaultAuthType, cloneBytes(h.DefaultEncPassword), true
+		}
+		return account, account.AuthType, cloneBytes(account.EncPassword), true
+	}
+	return HostUser{}, "", nil, false
+}
+
+func normalizeAccounts(accounts []HostUser) []HostUser {
+	seen := make(map[string]struct{}, len(accounts))
+	out := make([]HostUser, 0, len(accounts))
+	for _, account := range accounts {
+		username := strings.TrimSpace(account.Username)
+		if username == "" {
+			continue
+		}
+		if _, ok := seen[username]; ok {
+			continue
+		}
+		seen[username] = struct{}{}
+
+		account.Username = username
+		account.AuthType = normalizeAuthType(account.AuthType)
+		if account.UseDefault || account.AuthType == "" {
+			account.UseDefault = true
+			account.AuthType = ""
+			account.EncPassword = nil
+		} else {
+			account.UseDefault = false
+			if account.AuthType != "password" {
+				account.EncPassword = nil
+			}
+		}
+		out = append(out, account)
+	}
+	return out
+}
+
+func legacyAccountNames(user string, users []string) []string {
+	names := make([]string, 0, len(users)+1)
+	if strings.TrimSpace(user) != "" {
+		names = append(names, user)
+	}
+	names = append(names, users...)
+	return normalizeNames(names)
+}
+
+func normalizeNames(names []string) []string {
+	seen := make(map[string]struct{}, len(names))
+	var out []string
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+func normalizeAuthType(authType string) string {
+	switch strings.TrimSpace(strings.ToLower(authType)) {
+	case "password":
+		return "password"
+	case "key":
+		return "key"
+	default:
+		return ""
+	}
+}
+
+func cloneBytes(src []byte) []byte {
+	if len(src) == 0 {
 		return nil
 	}
-	return normalizeUsers([]string{h.User})
-}
-
-func (h *Host) Normalize() {
-	h.Users = h.UserList()
-	if len(h.Users) > 0 {
-		h.User = h.Users[0]
-		return
-	}
-	h.User = ""
-}
-
-func normalizeUsers(users []string) []string {
-	seen := make(map[string]struct{}, len(users))
-	var out []string
-	for _, user := range users {
-		user = strings.TrimSpace(user)
-		if user == "" {
-			continue
-		}
-		if _, ok := seen[user]; ok {
-			continue
-		}
-		seen[user] = struct{}{}
-		out = append(out, user)
-	}
+	out := make([]byte, len(src))
+	copy(out, src)
 	return out
 }

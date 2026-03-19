@@ -15,28 +15,38 @@ import (
 
 // Form field indices.
 const (
-	fAlias    = 0
-	fHostname = 1
-	fUser     = 2
-	fPort     = 3
-	fAuth     = 4 // not a textinput — toggle handled separately
-	fPassword = 5 // maps to formInputs[4]
+	fAlias = iota
+	fHostname
+	fUsers
+	fPort
+	fDefaultAuth
+	fDefaultPassword
+	fSelectedUser
+	fSelectedUserAuth
+	fSelectedUserPassword
 )
 
-// formInputIdx returns the textinput slice index for a given focus
-// position, or -1 for the auth toggle which has no textinput.
 func formInputIdx(focus int) int {
-	if focus >= 0 && focus <= 3 {
-		return focus
-	}
-	if focus == fPassword {
+	switch focus {
+	case fAlias:
+		return 0
+	case fHostname:
+		return 1
+	case fUsers:
+		return 2
+	case fPort:
+		return 3
+	case fDefaultPassword:
 		return 4
+	case fSelectedUserPassword:
+		return 5
+	default:
+		return -1
 	}
-	return -1
 }
 
-func newHostFormInputs(alias, hostname, user string, port int) []textinput.Model {
-	inputs := make([]textinput.Model, 5)
+func newHostFormInputs(alias, hostname, users string, port int) []textinput.Model {
+	inputs := make([]textinput.Model, 6)
 
 	inputs[0] = textinput.New()
 	inputs[0].Placeholder = "e.g. prod-web"
@@ -60,15 +70,22 @@ func newHostFormInputs(alias, hostname, user string, port int) []textinput.Model
 	inputs[3].Width = 10
 
 	inputs[4] = textinput.New()
-	inputs[4].Placeholder = "Enter password (optional)"
+	inputs[4].Placeholder = "Default password"
 	inputs[4].EchoMode = textinput.EchoPassword
 	inputs[4].EchoCharacter = '•'
 	inputs[4].CharLimit = 128
 	inputs[4].Width = 36
 
+	inputs[5] = textinput.New()
+	inputs[5].Placeholder = "Override password"
+	inputs[5].EchoMode = textinput.EchoPassword
+	inputs[5].EchoCharacter = '•'
+	inputs[5].CharLimit = 128
+	inputs[5].Width = 36
+
 	inputs[0].SetValue(alias)
 	inputs[1].SetValue(hostname)
-	inputs[2].SetValue(user)
+	inputs[2].SetValue(users)
 	if port > 0 {
 		inputs[3].SetValue(fmt.Sprintf("%d", port))
 	}
@@ -79,28 +96,41 @@ func newHostFormInputs(alias, hostname, user string, port int) []textinput.Model
 func (m model) startHostForm(editID string) (model, tea.Cmd) {
 	m.phase = phaseHostForm
 	m.formEditing = editID
-	m.formFocus = 0
+	m.formFocus = fAlias
 	m.formErr = ""
-	m.formAuthType = "key"
+	m.formDefaultAuth = "key"
+	m.formDefaultEncPassword = nil
+	m.formUserConfigs = nil
+	m.formUserCursor = 0
 
 	var alias, hostname, users string
 	var port int
 	if editID != "" {
 		for _, h := range m.store.Hosts {
-			if h.ID == editID {
-				alias = h.Alias
-				hostname = h.Hostname
-				users = strings.Join(h.UserList(), ", ")
-				port = h.Port
-				if h.AuthType != "" {
-					m.formAuthType = h.AuthType
-				}
-				break
+			if h.ID != editID {
+				continue
 			}
+			alias = h.Alias
+			hostname = h.Hostname
+			users = strings.Join(h.AccountNames(), ", ")
+			port = h.Port
+			m.formDefaultAuth = h.DefaultAuthType
+			m.formDefaultEncPassword = cloneFormBytes(h.DefaultEncPassword)
+			m.formUserConfigs = make([]formUserConfig, 0, len(h.Accounts))
+			for _, account := range h.Accounts {
+				m.formUserConfigs = append(m.formUserConfigs, formUserConfig{
+					Username:            account.Username,
+					UseDefault:          account.UseDefault,
+					AuthType:            account.AuthType,
+					ExistingEncPassword: cloneFormBytes(account.EncPassword),
+				})
+			}
+			break
 		}
 	}
 
 	m.formInputs = newHostFormInputs(alias, hostname, users, port)
+	m.syncFormUsers()
 	return m, textinput.Blink
 }
 
@@ -115,23 +145,34 @@ func (m model) updateHostForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.phase = phaseDashboard
 			m = m.refreshFiltered()
 			return m, nil
-
 		case "tab", "down":
 			return m.cycleFormFocus(1)
-
 		case "shift+tab", "up":
 			return m.cycleFormFocus(-1)
-
-		case " ":
-			if m.formFocus == fAuth {
-				if m.formAuthType == "key" {
-					m.formAuthType = "password"
-				} else {
-					m.formAuthType = "key"
-				}
+		case "left", "h":
+			switch m.formFocus {
+			case fSelectedUser:
+				m.selectFormUser(-1)
+				return m, nil
+			case fDefaultAuth:
+				m.selectDefaultAuth(-1)
+				return m, nil
+			case fSelectedUserAuth:
+				m.selectSelectedUserAuth(-1)
 				return m, nil
 			}
-
+		case "right", "l":
+			switch m.formFocus {
+			case fSelectedUser:
+				m.selectFormUser(1)
+				return m, nil
+			case fDefaultAuth:
+				m.selectDefaultAuth(1)
+				return m, nil
+			case fSelectedUserAuth:
+				m.selectSelectedUserAuth(1)
+				return m, nil
+			}
 		case "enter":
 			return m.submitHostForm()
 		}
@@ -140,27 +181,38 @@ func (m model) updateHostForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if idx := formInputIdx(m.formFocus); idx >= 0 {
 		var cmd tea.Cmd
 		m.formInputs[idx], cmd = m.formInputs[idx].Update(msg)
+		switch m.formFocus {
+		case fUsers:
+			m.syncFormUsers()
+		case fSelectedUserPassword:
+			m.storeSelectedUserPasswordInput()
+		}
 		return m, cmd
 	}
+
 	return m, nil
 }
 
 func (m model) cycleFormFocus(dir int) (tea.Model, tea.Cmd) {
-	maxFocus := fAuth
-	if m.formAuthType == "password" {
-		maxFocus = fPassword
-	}
-
 	if idx := formInputIdx(m.formFocus); idx >= 0 {
 		m.formInputs[idx].Blur()
 	}
 
-	m.formFocus += dir
-	if m.formFocus > maxFocus {
-		m.formFocus = 0
-	} else if m.formFocus < 0 {
-		m.formFocus = maxFocus
+	focuses := m.activeFormFocuses()
+	if len(focuses) == 0 {
+		return m, nil
 	}
+
+	cur := 0
+	for i, focus := range focuses {
+		if focus == m.formFocus {
+			cur = i
+			break
+		}
+	}
+
+	cur = (cur + dir + len(focuses)) % len(focuses)
+	m.formFocus = focuses[cur]
 
 	if idx := formInputIdx(m.formFocus); idx >= 0 {
 		m.formInputs[idx].Focus()
@@ -169,12 +221,28 @@ func (m model) cycleFormFocus(dir int) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) activeFormFocuses() []int {
+	focuses := []int{fAlias, fHostname, fUsers, fPort, fDefaultAuth}
+	if m.formDefaultAuth == "password" {
+		focuses = append(focuses, fDefaultPassword)
+	}
+	if len(m.formUserConfigs) == 0 {
+		return focuses
+	}
+
+	focuses = append(focuses, fSelectedUser, fSelectedUserAuth)
+	if user := m.currentFormUser(); user != nil && !user.UseDefault && user.AuthType == "password" {
+		focuses = append(focuses, fSelectedUserPassword)
+	}
+	return focuses
+}
+
 func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 	alias := strings.TrimSpace(m.formInputs[0].Value())
 	hostname := strings.TrimSpace(m.formInputs[1].Value())
 	users := parseUsers(m.formInputs[2].Value())
 	portStr := strings.TrimSpace(m.formInputs[3].Value())
-	pwd := m.formInputs[4].Value()
+	defaultPassword := m.formInputs[4].Value()
 
 	if alias == "" {
 		m.formErr = "Alias is required"
@@ -200,29 +268,55 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 	}
 
 	h := host.Host{
-		Alias:    alias,
-		Hostname: hostname,
-		Users:    users,
-		Port:     port,
-		AuthType: m.formAuthType,
+		Alias:           alias,
+		Hostname:        hostname,
+		Port:            port,
+		DefaultAuthType: m.formDefaultAuth,
+		Accounts:        make([]host.HostUser, 0, len(m.formUserConfigs)),
 	}
 
-	if m.formAuthType == "password" {
-		if pwd != "" {
-			enc, err := vault.Encrypt(m.encKey, []byte(pwd))
+	if m.formDefaultAuth == "password" {
+		switch {
+		case defaultPassword != "":
+			enc, err := vault.Encrypt(m.encKey, []byte(defaultPassword))
 			if err != nil {
-				m.formErr = "Failed to encrypt password: " + err.Error()
+				m.formErr = "Failed to encrypt default password: " + err.Error()
 				return m, nil
 			}
-			h.EncPassword = enc
-		} else if m.formEditing != "" {
-			for _, existing := range m.store.Hosts {
-				if existing.ID == m.formEditing {
-					h.EncPassword = existing.EncPassword
-					break
+			h.DefaultEncPassword = enc
+		case len(m.formDefaultEncPassword) > 0:
+			h.DefaultEncPassword = cloneFormBytes(m.formDefaultEncPassword)
+		default:
+			m.formErr = "Default password is required for password auth"
+			return m, nil
+		}
+	}
+
+	for _, cfg := range m.formUserConfigs {
+		account := host.HostUser{
+			Username:   cfg.Username,
+			UseDefault: cfg.UseDefault,
+		}
+		if !cfg.UseDefault {
+			account.AuthType = cfg.AuthType
+			if cfg.AuthType == "password" {
+				switch {
+				case cfg.Password != "":
+					enc, err := vault.Encrypt(m.encKey, []byte(cfg.Password))
+					if err != nil {
+						m.formErr = "Failed to encrypt password for " + cfg.Username + ": " + err.Error()
+						return m, nil
+					}
+					account.EncPassword = enc
+				case len(cfg.ExistingEncPassword) > 0:
+					account.EncPassword = cloneFormBytes(cfg.ExistingEncPassword)
+				default:
+					m.formErr = "Override password is required for " + cfg.Username
+					return m, nil
 				}
 			}
 		}
+		h.Accounts = append(h.Accounts, account)
 	}
 
 	if m.formEditing != "" {
@@ -257,10 +351,9 @@ func (m model) viewHostForm() string {
 	b.WriteString(titleStyle.Render("📝 "+title) + "\n\n")
 
 	renderField := func(focus int, label string, idx int) {
-		focused := m.formFocus == focus
 		lbl := inputLabelStyle.Render(label)
-		if focused {
-			lbl = lipgloss.NewStyle().Foreground(highlight).Bold(true).Render("▸ " + label)
+		if m.formFocus == focus {
+			lbl = focusedLabel("▸ " + label)
 		}
 		b.WriteString(lbl + "\n")
 		b.WriteString(m.formInputs[idx].View() + "\n\n")
@@ -268,66 +361,276 @@ func (m model) viewHostForm() string {
 
 	renderField(fAlias, "Alias", 0)
 	renderField(fHostname, "Hostname", 1)
-	renderField(fUser, "Users", 2)
+	renderField(fUsers, "Users", 2)
+	b.WriteString(hintStyle.Render("  Comma-separated usernames. Example: root, ubuntu, deploy") + "\n\n")
 	renderField(fPort, "Port", 3)
 
-	// Auth type toggle
-	{
-		focused := m.formFocus == fAuth
-		lbl := inputLabelStyle.Render("Auth Method")
-		if focused {
-			lbl = lipgloss.NewStyle().Foreground(highlight).Bold(true).Render("▸ Auth Method")
-		}
-		b.WriteString(lbl + "\n")
+	b.WriteString(m.renderDefaultAuthSection())
 
-		keyLbl := "○ SSH Key"
-		pwLbl := "○ Password"
-		keyS := lipgloss.NewStyle().Foreground(text)
-		pwS := lipgloss.NewStyle().Foreground(text)
-		if m.formAuthType == "key" {
-			keyLbl = "● SSH Key"
-			keyS = lipgloss.NewStyle().Foreground(highlight).Bold(true)
-		} else {
-			pwLbl = "● Password"
-			pwS = lipgloss.NewStyle().Foreground(highlight).Bold(true)
-		}
-
-		toggle := "  " + keyS.Render(keyLbl) + "    " + pwS.Render(pwLbl)
-		if focused {
-			toggle += hintStyle.Render("  (space to toggle)")
-		}
-		b.WriteString(toggle + "\n\n")
-	}
-
-	if m.formAuthType == "password" {
-		renderField(fPassword, "Password", 4)
-		if m.formEditing != "" {
-			b.WriteString(hintStyle.Render("  Leave empty to keep current password") + "\n\n")
-		}
+	if len(m.formUserConfigs) > 0 {
+		b.WriteString(m.renderSelectedUserSection())
 	}
 
 	if m.formErr != "" {
 		b.WriteString(errorStyle.Render("✗ "+m.formErr) + "\n\n")
 	}
 
-	b.WriteString(statusBarStyle.Render("tab/↑↓ navigate • space toggle auth • enter save • esc cancel"))
+	b.WriteString(statusBarStyle.Render("tab/↑↓ navigate • ←→ adjust selection • enter save • esc cancel"))
 	return boxStyle.Render(b.String())
+}
+
+func (m model) renderDefaultAuthSection() string {
+	var b strings.Builder
+	lbl := inputLabelStyle.Render("Default Auth")
+	if m.formFocus == fDefaultAuth {
+		lbl = focusedLabel("▸ Default Auth")
+	}
+	b.WriteString(lbl + "\n")
+	b.WriteString("  " + authChoice("SSH Key", m.formDefaultAuth == "key") + "    " +
+		authChoice("Password", m.formDefaultAuth == "password"))
+	if m.formFocus == fDefaultAuth {
+		b.WriteString(hintStyle.Render("  (left/right to change)"))
+	}
+	b.WriteString("\n\n")
+
+	if m.formDefaultAuth == "password" {
+		fieldLabel := "Default Password"
+		renderLabel := inputLabelStyle.Render(fieldLabel)
+		if m.formFocus == fDefaultPassword {
+			renderLabel = focusedLabel("▸ " + fieldLabel)
+		}
+		b.WriteString(renderLabel + "\n")
+		b.WriteString(m.formInputs[4].View() + "\n")
+		if m.formEditing != "" && len(m.formDefaultEncPassword) > 0 {
+			b.WriteString(hintStyle.Render("  Leave empty to keep the current default password") + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
+func (m model) renderSelectedUserSection() string {
+	user := m.currentFormUser()
+	if user == nil {
+		return ""
+	}
+
+	var b strings.Builder
+	lbl := inputLabelStyle.Render("Selected User")
+	if m.formFocus == fSelectedUser {
+		lbl = focusedLabel("▸ Selected User")
+	}
+	b.WriteString(lbl + "\n")
+	b.WriteString("  " + m.renderUserTabs())
+	if m.formFocus == fSelectedUser {
+		b.WriteString(hintStyle.Render("  (left/right to switch)"))
+	}
+	b.WriteString("\n\n")
+
+	modeLabel := inputLabelStyle.Render("User Auth")
+	if m.formFocus == fSelectedUserAuth {
+		modeLabel = focusedLabel("▸ User Auth")
+	}
+	b.WriteString(modeLabel + "\n")
+	b.WriteString("  " + authChoice("Use Host Default", user.UseDefault) + "    " +
+		authChoice("Password Override", !user.UseDefault && user.AuthType == "password") + "    " +
+		authChoice("SSH Key Override", !user.UseDefault && user.AuthType == "key"))
+	if m.formFocus == fSelectedUserAuth {
+		b.WriteString(hintStyle.Render("  (left/right to change)"))
+	}
+	b.WriteString("\n")
+	b.WriteString(hintStyle.Render("  Default means this user uses the host's main auth settings.") + "\n\n")
+
+	if !user.UseDefault && user.AuthType == "password" {
+		fieldLabel := "Override Password"
+		renderLabel := inputLabelStyle.Render(fieldLabel)
+		if m.formFocus == fSelectedUserPassword {
+			renderLabel = focusedLabel("▸ " + fieldLabel)
+		}
+		b.WriteString(renderLabel + "\n")
+		b.WriteString(m.formInputs[5].View() + "\n")
+		if m.formEditing != "" && len(user.ExistingEncPassword) > 0 {
+			b.WriteString(hintStyle.Render("  Leave empty to keep the current password for this user") + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
+func authChoice(label string, selected bool) string {
+	if selected {
+		return selectedChip("● " + label)
+	}
+	return lipgloss.NewStyle().
+		Foreground(subtle).
+		Render("○ " + label)
+}
+
+func (m model) renderUserTabs() string {
+	var parts []string
+	for i, cfg := range m.formUserConfigs {
+		if i == m.formUserCursor {
+			parts = append(parts, selectedChip(cfg.Username))
+			continue
+		}
+		parts = append(parts, lipgloss.NewStyle().Foreground(subtle).Render(cfg.Username))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func selectedChip(label string) string {
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#111827")).
+		Background(highlight).
+		Bold(true).
+		Padding(0, 1).
+		Render(label)
+}
+
+func focusedLabel(label string) string {
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#111827")).
+		Background(accent).
+		Bold(true).
+		Padding(0, 1).
+		Render(label)
+}
+
+func (m *model) selectDefaultAuth(dir int) {
+	if dir < 0 {
+		m.formDefaultAuth = "key"
+		return
+	}
+	m.formDefaultAuth = "password"
+}
+
+func (m *model) selectSelectedUserAuth(dir int) {
+	user := m.currentFormUser()
+	if user == nil {
+		return
+	}
+
+	options := []struct {
+		useDefault bool
+		authType   string
+	}{
+		{useDefault: true, authType: ""},
+		{useDefault: false, authType: "password"},
+		{useDefault: false, authType: "key"},
+	}
+
+	index := 0
+	switch {
+	case user.UseDefault:
+		index = 0
+	case user.AuthType == "password":
+		index = 1
+	default:
+		index = 2
+	}
+
+	index = (index + dir + len(options)) % len(options)
+	user.UseDefault = options[index].useDefault
+	user.AuthType = options[index].authType
+	m.loadSelectedUserPasswordInput()
+}
+
+func (m *model) selectFormUser(delta int) {
+	if len(m.formUserConfigs) == 0 {
+		return
+	}
+	m.storeSelectedUserPasswordInput()
+	m.formUserCursor = (m.formUserCursor + delta + len(m.formUserConfigs)) % len(m.formUserConfigs)
+	m.loadSelectedUserPasswordInput()
+}
+
+func (m *model) currentFormUser() *formUserConfig {
+	if len(m.formUserConfigs) == 0 {
+		return nil
+	}
+	if m.formUserCursor < 0 {
+		m.formUserCursor = 0
+	}
+	if m.formUserCursor >= len(m.formUserConfigs) {
+		m.formUserCursor = len(m.formUserConfigs) - 1
+	}
+	return &m.formUserConfigs[m.formUserCursor]
+}
+
+func (m *model) syncFormUsers() {
+	names := parseUsers(m.formInputs[2].Value())
+	existing := make(map[string]formUserConfig, len(m.formUserConfigs))
+	for _, cfg := range m.formUserConfigs {
+		existing[cfg.Username] = cfg
+	}
+
+	next := make([]formUserConfig, 0, len(names))
+	for _, name := range names {
+		if cfg, ok := existing[name]; ok {
+			cfg.Username = name
+			next = append(next, cfg)
+			continue
+		}
+		next = append(next, formUserConfig{
+			Username:   name,
+			UseDefault: true,
+		})
+	}
+
+	m.formUserConfigs = next
+	if len(m.formUserConfigs) == 0 {
+		m.formUserCursor = 0
+		m.formInputs[5].SetValue("")
+		return
+	}
+	if m.formUserCursor >= len(m.formUserConfigs) {
+		m.formUserCursor = len(m.formUserConfigs) - 1
+	}
+	m.loadSelectedUserPasswordInput()
+}
+
+func (m *model) loadSelectedUserPasswordInput() {
+	user := m.currentFormUser()
+	if user == nil {
+		m.formInputs[5].SetValue("")
+		return
+	}
+	m.formInputs[5].SetValue(user.Password)
+}
+
+func (m *model) storeSelectedUserPasswordInput() {
+	user := m.currentFormUser()
+	if user == nil {
+		return
+	}
+	user.Password = m.formInputs[5].Value()
 }
 
 func parseUsers(raw string) []string {
 	parts := strings.Split(raw, ",")
-	users := make([]string, 0, len(parts))
 	seen := make(map[string]struct{}, len(parts))
+	out := make([]string, 0, len(parts))
 	for _, part := range parts {
-		user := strings.TrimSpace(part)
-		if user == "" {
+		part = strings.TrimSpace(part)
+		if part == "" {
 			continue
 		}
-		if _, ok := seen[user]; ok {
+		if _, ok := seen[part]; ok {
 			continue
 		}
-		seen[user] = struct{}{}
-		users = append(users, user)
+		seen[part] = struct{}{}
+		out = append(out, part)
 	}
-	return users
+	return out
+}
+
+func cloneFormBytes(src []byte) []byte {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]byte, len(src))
+	copy(out, src)
+	return out
 }

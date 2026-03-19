@@ -26,6 +26,14 @@ const (
 // sshDoneMsg is sent after an SSH session completes (or fails).
 type sshDoneMsg struct{ err error }
 
+type formUserConfig struct {
+	Username            string
+	UseDefault          bool
+	AuthType            string
+	Password            string
+	ExistingEncPassword []byte
+}
+
 type model struct {
 	phase    phase
 	width    int
@@ -51,11 +59,14 @@ type model struct {
 	selectedHost  host.Host
 
 	// Host form
-	formInputs   []textinput.Model
-	formFocus    int
-	formEditing  string
-	formErr      string
-	formAuthType string
+	formInputs             []textinput.Model
+	formFocus              int
+	formEditing            string
+	formErr                string
+	formDefaultAuth        string
+	formDefaultEncPassword []byte
+	formUserConfigs        []formUserConfig
+	formUserCursor         int
 }
 
 func zeroBytes(b []byte) {
