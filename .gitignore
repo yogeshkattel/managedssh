@@ -14,10 +14,12 @@ managedssh
 
 # Go workspace
 go.work
+go.work.sum
 
 # IDE
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~
@@ -30,6 +32,3 @@ backup/
 # OS
 .DS_Store
 Thumbs.db
-
-# Documentation build
-docs/_build/
