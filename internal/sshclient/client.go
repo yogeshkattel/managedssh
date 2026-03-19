@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/term"
 )
 
@@ -22,7 +23,7 @@ type Session struct {
 	Host     string
 	Port     int
 	User     string
-	Password string
+	Password []byte
 
 	stdin  io.Reader
 	stdout io.Writer
@@ -34,15 +35,18 @@ func (s *Session) SetStdout(w io.Writer) { s.stdout = w }
 func (s *Session) SetStderr(w io.Writer) { s.stderr = w }
 
 func (s *Session) Run() error {
+	defer s.zeroPassword()
+
 	var authMethods []ssh.AuthMethod
 
-	if s.Password != "" {
-		authMethods = append(authMethods, ssh.Password(s.Password))
+	if len(s.Password) > 0 {
+		pw := string(s.Password)
+		authMethods = append(authMethods, ssh.Password(pw))
 		authMethods = append(authMethods, ssh.KeyboardInteractive(
-			func(_, _ string, questions []string, _ []bool) ([]string, error) {
+			func(_, _ string, questions []string, echos []bool) ([]string, error) {
 				answers := make([]string, len(questions))
-				for i := range questions {
-					answers[i] = s.Password
+				if len(questions) == 1 && !echos[0] {
+					answers[0] = pw
 				}
 				return answers, nil
 			},
@@ -62,10 +66,15 @@ func (s *Session) Run() error {
 		return fmt.Errorf("no authentication method available (no password, agent, or key files found)")
 	}
 
+	hostKeyCallback, err := buildHostKeyCallback()
+	if err != nil {
+		return fmt.Errorf("known_hosts setup failed: %w", err)
+	}
+
 	config := &ssh.ClientConfig{
 		User:            s.User,
 		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         10 * time.Second,
 	}
 
@@ -116,7 +125,6 @@ func (s *Session) Run() error {
 		return fmt.Errorf("shell failed: %w", err)
 	}
 
-	// Forward terminal resize signals to the remote PTY.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGWINCH)
 	go func() {
@@ -126,9 +134,40 @@ func (s *Session) Run() error {
 			}
 		}
 	}()
-	defer signal.Stop(sigCh)
+	defer func() {
+		signal.Stop(sigCh)
+		close(sigCh)
+	}()
 
 	return session.Wait()
+}
+
+func (s *Session) zeroPassword() {
+	for i := range s.Password {
+		s.Password[i] = 0
+	}
+	s.Password = nil
+}
+
+// buildHostKeyCallback loads ~/.ssh/known_hosts for host key verification.
+// If the file doesn't exist yet it is created so future connections are
+// verified (trust-on-first-use will be handled by the ssh library's error
+// reporting — the user sees a clear error and can add the key manually).
+func buildHostKeyCallback() (ssh.HostKeyCallback, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	khPath := filepath.Join(home, ".ssh", "known_hosts")
+	if _, err := os.Stat(khPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(khPath), 0700); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(khPath, nil, 0600); err != nil {
+			return nil, err
+		}
+	}
+	return knownhosts.New(khPath)
 }
 
 func dialAgent() (ssh.AuthMethod, net.Conn) {
@@ -151,7 +190,17 @@ func loadKeyFiles() []ssh.Signer {
 	names := []string{"id_ed25519", "id_rsa", "id_ecdsa"}
 	var signers []ssh.Signer
 	for _, name := range names {
-		data, err := os.ReadFile(filepath.Join(home, ".ssh", name))
+		p := filepath.Join(home, ".ssh", name)
+
+		info, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if perm := info.Mode().Perm(); perm&0077 != 0 {
+			continue
+		}
+
+		data, err := os.ReadFile(p)
 		if err != nil {
 			continue
 		}

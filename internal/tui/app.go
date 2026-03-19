@@ -33,9 +33,9 @@ type model struct {
 
 	encKey []byte
 
-	// Auth (setup + unlock)
+	// Auth (setup + unlock) — password stored as []byte so it can be zeroed.
 	input    textinput.Model
-	password string
+	password []byte
 	err      string
 
 	// Dashboard
@@ -53,6 +53,12 @@ type model struct {
 	formEditing  string
 	formErr      string
 	formAuthType string
+}
+
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
 func newPasswordInput(placeholder string) textinput.Model {
@@ -135,6 +141,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
+			vault.ZeroKey(m.encKey)
 			m.quitting = true
 			return m, tea.Quit
 		}
@@ -192,12 +199,12 @@ func (m model) View() string {
 
 func (m model) updateSetup(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if key, ok := msg.(tea.KeyMsg); ok && key.String() == "enter" {
-		val := strings.TrimSpace(m.input.Value())
+		val := m.input.Value()
 		if len(val) < 8 {
 			m.err = "Master key must be at least 8 characters"
 			return m, nil
 		}
-		m.password = val
+		m.password = []byte(val)
 		m.err = ""
 		m.phase = phaseSetupConfirm
 		m.input = newPasswordInput("Confirm master key...")
@@ -233,28 +240,30 @@ func (m model) updateSetupConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch key.String() {
 		case "esc":
 			m.phase = phaseSetup
-			m.password = ""
+			zeroBytes(m.password)
+			m.password = nil
 			m.err = ""
 			m.input = newPasswordInput("Choose a master key...")
 			return m, textinput.Blink
 		case "enter":
-			val := strings.TrimSpace(m.input.Value())
-			if val != m.password {
+			val := m.input.Value()
+			if val != string(m.password) {
 				m.err = "Keys do not match — try again"
 				m.input.Reset()
 				return m, nil
 			}
 			encKey, err := vault.Create(val)
 			if err != nil {
-				m.err = "Failed to create vault: " + err.Error()
+				m.err = "Failed to create vault"
 				return m, nil
 			}
 			m.encKey = encKey
-			m.password = ""
+			zeroBytes(m.password)
+			m.password = nil
 			m.err = ""
 			dm, derr := m.initDashboard()
 			if derr != nil {
-				m.err = derr.Error()
+				m.err = "Failed to load host store"
 				return m, nil
 			}
 			return dm, nil
@@ -285,13 +294,13 @@ func (m model) viewSetupConfirm() string {
 
 func (m model) updateUnlock(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if key, ok := msg.(tea.KeyMsg); ok && key.String() == "enter" {
-		val := strings.TrimSpace(m.input.Value())
+		val := m.input.Value()
 		encKey, err := vault.Unlock(val)
 		if err != nil {
 			if errors.Is(err, vault.ErrWrongPassword) {
 				m.err = "Incorrect master key"
 			} else {
-				m.err = "Error: " + err.Error()
+				m.err = "Unlock failed"
 			}
 			m.input.Reset()
 			return m, nil
@@ -300,7 +309,7 @@ func (m model) updateUnlock(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = ""
 		dm, derr := m.initDashboard()
 		if derr != nil {
-			m.err = derr.Error()
+			m.err = "Failed to load host store"
 			return m, nil
 		}
 		return dm, nil
@@ -334,6 +343,9 @@ func Start() error {
 		return err
 	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
-	_, err = p.Run()
+	result, err := p.Run()
+	if fm, ok := result.(model); ok {
+		vault.ZeroKey(fm.encKey)
+	}
 	return err
 }

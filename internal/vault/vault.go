@@ -14,11 +14,17 @@ import (
 
 const (
 	verifierPlaintext = "managedssh-vault-ok"
-	argonTime         = 1
-	argonMemory       = 64 * 1024
+	argonTime         = 3
+	argonMemory       = 128 * 1024
 	argonThreads      = 4
 	argonKeyLen       = 32
 	saltLen           = 16
+)
+
+// AAD context tags prevent ciphertext from being transplanted between roles.
+var (
+	aadVaultVerifier = []byte("managedssh:vault-verifier")
+	aadHostPassword  = []byte("managedssh:host-password")
 )
 
 var ErrWrongPassword = errors.New("incorrect master key")
@@ -61,7 +67,7 @@ func deriveKey(password, salt []byte) []byte {
 	return argon2.IDKey(password, salt, argonTime, argonMemory, argonThreads, argonKeyLen)
 }
 
-func encryptBytes(key, plaintext []byte) (nonce, ciphertext []byte, err error) {
+func encryptBytes(key, plaintext, aad []byte) (nonce, ciphertext []byte, err error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, nil, err
@@ -74,11 +80,11 @@ func encryptBytes(key, plaintext []byte) (nonce, ciphertext []byte, err error) {
 	if _, err = rand.Read(nonce); err != nil {
 		return nil, nil, err
 	}
-	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
+	ciphertext = gcm.Seal(nil, nonce, plaintext, aad)
 	return nonce, ciphertext, nil
 }
 
-func decryptBytes(key, nonce, ciphertext []byte) ([]byte, error) {
+func decryptBytes(key, nonce, ciphertext, aad []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -87,7 +93,17 @@ func decryptBytes(key, nonce, ciphertext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	return gcm.Open(nil, nonce, ciphertext, aad)
+}
+
+// atomicWrite writes data to a temporary file then renames it into
+// place so a crash never leaves a truncated file.
+func atomicWrite(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // Create initialises a new vault with the given master password and
@@ -99,7 +115,7 @@ func Create(password string) ([]byte, error) {
 	}
 
 	key := deriveKey([]byte(password), salt)
-	nonce, ciphertext, err := encryptBytes(key, []byte(verifierPlaintext))
+	nonce, ciphertext, err := encryptBytes(key, []byte(verifierPlaintext), aadVaultVerifier)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +139,7 @@ func Create(password string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(p, data, 0600); err != nil {
+	if err := atomicWrite(p, data, 0600); err != nil {
 		return nil, err
 	}
 
@@ -147,7 +163,7 @@ func Unlock(password string) ([]byte, error) {
 	}
 
 	key := deriveKey([]byte(password), m.Salt)
-	plain, err := decryptBytes(key, m.Nonce, m.Verifier)
+	plain, err := decryptBytes(key, m.Nonce, m.Verifier, aadVaultVerifier)
 	if err != nil {
 		return nil, ErrWrongPassword
 	}
@@ -157,10 +173,10 @@ func Unlock(password string) ([]byte, error) {
 	return key, nil
 }
 
-// Encrypt encrypts arbitrary data with the given key.
-// The returned blob contains the nonce prepended to the ciphertext.
+// Encrypt encrypts arbitrary data with the given key using the
+// host-password AAD context. The nonce is prepended to the ciphertext.
 func Encrypt(key, plaintext []byte) ([]byte, error) {
-	nonce, ct, err := encryptBytes(key, plaintext)
+	nonce, ct, err := encryptBytes(key, plaintext, aadHostPassword)
 	if err != nil {
 		return nil, err
 	}
@@ -181,5 +197,12 @@ func Decrypt(key, blob []byte) ([]byte, error) {
 	if len(blob) < ns {
 		return nil, errors.New("ciphertext too short")
 	}
-	return gcm.Open(nil, blob[:ns], blob[ns:], nil)
+	return gcm.Open(nil, blob[:ns], blob[ns:], aadHostPassword)
+}
+
+// ZeroKey overwrites a key slice with zeros (best-effort in Go).
+func ZeroKey(key []byte) {
+	for i := range key {
+		key[i] = 0
+	}
 }

@@ -174,7 +174,7 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 	hostname := strings.TrimSpace(m.formInputs[1].Value())
 	user := strings.TrimSpace(m.formInputs[2].Value())
 	portStr := strings.TrimSpace(m.formInputs[3].Value())
-	pwd := strings.TrimSpace(m.formInputs[4].Value())
+	pwd := m.formInputs[4].Value()
 
 	if alias == "" {
 		m.formErr = "Alias is required"
@@ -226,9 +226,15 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 	}
 
 	if m.formEditing != "" {
-		_ = m.store.Update(m.formEditing, h)
+		if err := m.store.Update(m.formEditing, h); err != nil {
+			m.formErr = "Failed to save: " + err.Error()
+			return m, nil
+		}
 	} else {
-		_ = m.store.Add(h)
+		if err := m.store.Add(h); err != nil {
+			m.formErr = "Failed to save: " + err.Error()
+			return m, nil
+		}
 	}
 
 	m.phase = phaseDashboard

@@ -90,7 +90,9 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.filtered) > 0 {
 			if m.confirmDelete {
 				h := m.filtered[m.hostCursor]
-				_ = m.store.Delete(h.ID)
+				if err := m.store.Delete(h.ID); err != nil {
+					m.connErr = "Delete failed: " + err.Error()
+				}
 				m.confirmDelete = false
 				m = m.refreshFiltered()
 			} else {
@@ -108,11 +110,11 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) connectSSH() (tea.Model, tea.Cmd) {
 	h := m.filtered[m.hostCursor]
 
-	var password string
+	var password []byte
 	if h.AuthType == "password" && len(h.EncPassword) > 0 {
 		dec, err := vault.Decrypt(m.encKey, h.EncPassword)
 		if err == nil {
-			password = string(dec)
+			password = dec
 		}
 	}
 

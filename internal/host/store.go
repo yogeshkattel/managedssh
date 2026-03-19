@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,10 +25,12 @@ type Store struct {
 	Hosts []Host `json:"hosts"`
 }
 
-func genID() string {
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+func genID() (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generating host ID: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func NewStore(dir string) (*Store, error) {
@@ -56,12 +59,20 @@ func (s *Store) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0600)
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
 }
 
 func (s *Store) Add(h Host) error {
 	if h.ID == "" {
-		h.ID = genID()
+		id, err := genID()
+		if err != nil {
+			return err
+		}
+		h.ID = id
 	}
 	if h.Port == 0 {
 		h.Port = 22
