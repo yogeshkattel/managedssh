@@ -103,6 +103,7 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 	m.formDefaultKeyValue = ""
 	m.formDefaultKeyPath = ""
 	m.formDefaultEncKey = nil
+	m.formDefaultEncKeyPass = nil
 	m.formUserConfigs = nil
 	m.formUserCursor = 0
 	m.formPathSuggestions = nil
@@ -123,6 +124,7 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 			m.formDefaultEncPassword = cloneFormBytes(h.DefaultEncPassword)
 			m.formDefaultKeyPath = h.DefaultKeyPath
 			m.formDefaultEncKey = cloneFormBytes(h.DefaultEncKey)
+			m.formDefaultEncKeyPass = cloneFormBytes(h.DefaultEncKeyPass)
 			if h.DefaultKeyPath != "" {
 				m.formDefaultKeyValue = h.DefaultKeyPath
 			}
@@ -137,6 +139,7 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 					KeyValue:            keyValue,
 					ExistingKeyPath:     account.KeyPath,
 					ExistingEncKey:      cloneFormBytes(account.EncKey),
+					ExistingEncKeyPass:  cloneFormBytes(account.EncKeyPass),
 				})
 			}
 			break
@@ -334,6 +337,9 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 		switch {
 		case keyPath != "":
 			h.DefaultKeyPath = keyPath
+			if keyPath == m.formDefaultKeyPath {
+				h.DefaultEncKeyPass = cloneFormBytes(m.formDefaultEncKeyPass)
+			}
 		case keyPlain != "":
 			enc, err := vault.Encrypt(m.encKey, []byte(keyPlain))
 			if err != nil {
@@ -343,8 +349,10 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 			h.DefaultEncKey = enc
 		case m.formDefaultKeyPath != "":
 			h.DefaultKeyPath = m.formDefaultKeyPath
+			h.DefaultEncKeyPass = cloneFormBytes(m.formDefaultEncKeyPass)
 		case len(m.formDefaultEncKey) > 0:
 			h.DefaultEncKey = cloneFormBytes(m.formDefaultEncKey)
+			h.DefaultEncKeyPass = cloneFormBytes(m.formDefaultEncKeyPass)
 		}
 	}
 
@@ -375,6 +383,9 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 				switch {
 				case keyPath != "":
 					account.KeyPath = keyPath
+					if keyPath == cfg.ExistingKeyPath {
+						account.EncKeyPass = cloneFormBytes(cfg.ExistingEncKeyPass)
+					}
 				case keyPlain != "":
 					enc, err := vault.Encrypt(m.encKey, []byte(keyPlain))
 					if err != nil {
@@ -384,8 +395,10 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 					account.EncKey = enc
 				case cfg.ExistingKeyPath != "":
 					account.KeyPath = cfg.ExistingKeyPath
+					account.EncKeyPass = cloneFormBytes(cfg.ExistingEncKeyPass)
 				case len(cfg.ExistingEncKey) > 0:
 					account.EncKey = cloneFormBytes(cfg.ExistingEncKey)
+					account.EncKeyPass = cloneFormBytes(cfg.ExistingEncKeyPass)
 				}
 			}
 		}

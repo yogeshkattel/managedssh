@@ -25,12 +25,14 @@ const (
 	phaseUserSelect
 	phaseHostVerifying
 	phaseHostTrustConfirm
+	phaseKeyPassphrasePrompt
 )
 
 // sshDoneMsg is sent after an SSH session completes (or fails).
 type sshDoneMsg struct{ err error }
 type hostVerifyDoneMsg struct{ err error }
 type hostTrustDoneMsg struct{ err error }
+type saveKeyPassDoneMsg struct{ err error }
 
 type formUserConfig struct {
 	Username            string
@@ -41,6 +43,7 @@ type formUserConfig struct {
 	KeyValue            string
 	ExistingKeyPath     string
 	ExistingEncKey      []byte
+	ExistingEncKeyPass  []byte
 }
 
 type model struct {
@@ -78,6 +81,7 @@ type model struct {
 	formDefaultKeyValue    string
 	formDefaultKeyPath     string
 	formDefaultEncKey      []byte
+	formDefaultEncKeyPass  []byte
 	formUserConfigs        []formUserConfig
 	formUserCursor         int
 	formPathSuggestions    []string
@@ -85,6 +89,12 @@ type model struct {
 	pendingHost            host.Host
 	pendingEditID          string
 	pendingTrust           *sshclient.UnknownHostError
+	connectHost            host.Host
+	connectUser            string
+	connectResolved        host.ResolvedAuth
+	connectPassphraseInput textinput.Model
+	pendingKeyPassSave     bool
+	pendingKeyPassphrase   []byte
 }
 
 func zeroBytes(b []byte) {
@@ -109,6 +119,17 @@ func newSearchInput() textinput.Model {
 	ti.Placeholder = "Type to filter hosts..."
 	ti.CharLimit = 64
 	ti.Width = 30
+	return ti
+}
+
+func newKeyPassphraseInput() textinput.Model {
+	ti := textinput.New()
+	ti.Placeholder = "Enter SSH key passphrase..."
+	ti.EchoMode = textinput.EchoPassword
+	ti.EchoCharacter = '•'
+	ti.Focus()
+	ti.CharLimit = 256
+	ti.Width = 40
 	return ti
 }
 
@@ -180,13 +201,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sshDoneMsg:
 		m.connErr = ""
 		if msg.err != nil {
+			if m.phase == phaseDashboard && m.pendingKeyPassSave {
+				m.phase = phaseKeyPassphrasePrompt
+				m.connectPassphraseInput = newKeyPassphraseInput()
+			}
 			m.connErr = msg.err.Error()
+			m.pendingKeyPassSave = false
+			zeroBytes(m.pendingKeyPassphrase)
+			m.pendingKeyPassphrase = nil
+			return m, nil
+		}
+		if m.pendingKeyPassSave && len(m.pendingKeyPassphrase) > 0 {
+			return m, saveKeyPassphraseCmd(m.store, m.connectHost.ID, m.connectUser, m.encKey, m.pendingKeyPassphrase)
 		}
 		return m, nil
 	case hostVerifyDoneMsg:
 		return m.handleHostVerifyDone(msg)
 	case hostTrustDoneMsg:
 		return m.handleHostTrustDone(msg)
+	case saveKeyPassDoneMsg:
+		if msg.err != nil {
+			m.connErr = "Connected, but failed to save key passphrase: " + msg.err.Error()
+		}
+		m.pendingKeyPassSave = false
+		zeroBytes(m.pendingKeyPassphrase)
+		m.pendingKeyPassphrase = nil
+		return m, nil
 	}
 
 	switch m.phase {
@@ -206,6 +246,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateHostVerifying(msg)
 	case phaseHostTrustConfirm:
 		return m.updateHostTrustConfirm(msg)
+	case phaseKeyPassphrasePrompt:
+		return m.updateKeyPassphrasePrompt(msg)
 	}
 	return m, nil
 }
@@ -233,6 +275,8 @@ func (m model) View() string {
 		content = m.viewHostVerifying()
 	case phaseHostTrustConfirm:
 		content = m.viewHostTrustConfirm()
+	case phaseKeyPassphrasePrompt:
+		content = m.viewKeyPassphrasePrompt()
 	}
 
 	if m.width > 0 {
@@ -511,6 +555,10 @@ func verifyHostBeforeSave(h host.Host, encKey []byte) error {
 			if errors.As(err, &unknown) {
 				return unknown
 			}
+			var needPass *sshclient.KeyPassphraseRequiredError
+			if errors.As(err, &needPass) {
+				continue
+			}
 			return fmt.Errorf("verification failed for %s: %w", username, err)
 		}
 	}
@@ -542,6 +590,79 @@ func (m model) viewHostTrustConfirm() string {
 	b.WriteString(hintStyle.Render("Press y to trust and continue, or n to cancel save.") + "\n")
 	b.WriteString(statusBarStyle.Render("y trust • n cancel • enter trust • esc cancel"))
 	return boxStyle.Render(b.String())
+}
+
+func (m model) updateKeyPassphrasePrompt(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := msg.(tea.KeyMsg); ok {
+		switch key.String() {
+		case "esc":
+			m.phase = phaseDashboard
+			m.connErr = "SSH key passphrase entry cancelled"
+			return m, nil
+		case "enter":
+			passphrase := []byte(m.connectPassphraseInput.Value())
+			if len(passphrase) == 0 {
+				m.connErr = "SSH key passphrase is required"
+				return m, nil
+			}
+			zeroBytes(m.pendingKeyPassphrase)
+			m.pendingKeyPassphrase = append([]byte(nil), passphrase...)
+			m.pendingKeyPassSave = true
+			return m.connectSSHWithResolved(m.connectHost, m.connectUser, m.connectResolved, passphrase, true)
+		}
+	}
+
+	var cmd tea.Cmd
+	m.connectPassphraseInput, cmd = m.connectPassphraseInput.Update(msg)
+	return m, cmd
+}
+
+func (m model) viewKeyPassphrasePrompt() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("SSH Key Passphrase") + "\n\n")
+	b.WriteString(subtitleStyle.Render("This SSH key is encrypted and needs its passphrase.") + "\n\n")
+	b.WriteString(inputLabelStyle.Render("User") + "\n")
+	b.WriteString(detailValueStyle.Render(m.connectUser+" @ "+m.connectHost.Hostname) + "\n\n")
+	b.WriteString(inputLabelStyle.Render("Passphrase") + "\n")
+	b.WriteString(m.connectPassphraseInput.View() + "\n\n")
+	if m.connErr != "" {
+		b.WriteString(errorStyle.Render("✗ "+m.connErr) + "\n\n")
+	}
+	b.WriteString(statusBarStyle.Render("enter connect • esc cancel"))
+	return boxStyle.Render(b.String())
+}
+
+func saveKeyPassphraseCmd(store *host.Store, hostID, username string, encKey []byte, passphrase []byte) tea.Cmd {
+	return func() tea.Msg {
+		return saveKeyPassDoneMsg{err: saveKeyPassphrase(store, hostID, username, encKey, passphrase)}
+	}
+}
+
+func saveKeyPassphrase(store *host.Store, hostID, username string, encKey []byte, passphrase []byte) error {
+	enc, err := vault.Encrypt(encKey, passphrase)
+	if err != nil {
+		return err
+	}
+	for i := range store.Hosts {
+		if store.Hosts[i].ID != hostID {
+			continue
+		}
+		account, _, ok := store.Hosts[i].ResolveAccount(username)
+		if !ok {
+			return fmt.Errorf("account not found")
+		}
+		if account.UseDefault {
+			store.Hosts[i].DefaultEncKeyPass = enc
+			return store.Save()
+		}
+		for j := range store.Hosts[i].Accounts {
+			if store.Hosts[i].Accounts[j].Username == username {
+				store.Hosts[i].Accounts[j].EncKeyPass = enc
+				return store.Save()
+			}
+		}
+	}
+	return fmt.Errorf("host not found")
 }
 
 // ------------------------------------------------------------------

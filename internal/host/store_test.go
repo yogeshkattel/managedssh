@@ -61,8 +61,9 @@ func TestResolveAccountPrefersUserOverride(t *testing.T) {
 
 func TestResolveAccountReturnsDefaultInlineKey(t *testing.T) {
 	h := Host{
-		DefaultAuthType: "key",
-		DefaultEncKey:   []byte("inline-key"),
+		DefaultAuthType:   "key",
+		DefaultEncKey:     []byte("inline-key"),
+		DefaultEncKeyPass: []byte("inline-pass"),
 		Accounts: []HostUser{
 			{Username: "root", UseDefault: true},
 		},
@@ -71,7 +72,28 @@ func TestResolveAccountReturnsDefaultInlineKey(t *testing.T) {
 	h.Normalize()
 
 	_, resolved, ok := h.ResolveAccount("root")
-	if !ok || resolved.AuthType != "key" || string(resolved.EncKey) != "inline-key" {
-		t.Fatalf("unexpected default key resolution: ok=%v auth=%q enc_key=%q", ok, resolved.AuthType, string(resolved.EncKey))
+	if !ok || resolved.AuthType != "key" || string(resolved.EncKey) != "inline-key" || string(resolved.EncKeyPass) != "inline-pass" {
+		t.Fatalf("unexpected default key resolution: ok=%v auth=%q enc_key=%q enc_key_pass=%q", ok, resolved.AuthType, string(resolved.EncKey), string(resolved.EncKeyPass))
+	}
+}
+
+func TestNormalizeClearsKeyPassphraseForPasswordAuth(t *testing.T) {
+	h := Host{
+		DefaultAuthType:    "password",
+		DefaultEncPassword: []byte("pw"),
+		DefaultEncKeyPass:  []byte("should-clear"),
+		Accounts: []HostUser{
+			{Username: "root", UseDefault: true},
+			{Username: "deploy", AuthType: "password", EncPassword: []byte("pw2"), EncKeyPass: []byte("should-clear")},
+		},
+	}
+
+	h.Normalize()
+
+	if len(h.DefaultEncKeyPass) != 0 {
+		t.Fatalf("expected default key passphrase to clear, got %q", string(h.DefaultEncKeyPass))
+	}
+	if len(h.Accounts[1].EncKeyPass) != 0 {
+		t.Fatalf("expected override key passphrase to clear, got %q", string(h.Accounts[1].EncKeyPass))
 	}
 }

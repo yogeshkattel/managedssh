@@ -19,6 +19,7 @@ type Host struct {
 	DefaultEncPassword []byte     `json:"default_enc_password,omitempty"`
 	DefaultKeyPath     string     `json:"default_key_path,omitempty"`
 	DefaultEncKey      []byte     `json:"default_enc_key,omitempty"`
+	DefaultEncKeyPass  []byte     `json:"default_enc_key_pass,omitempty"`
 	Accounts           []HostUser `json:"accounts,omitempty"`
 
 	// Legacy fields kept for backward compatibility with existing hosts.json.
@@ -35,6 +36,7 @@ type HostUser struct {
 	EncPassword []byte `json:"enc_password,omitempty"`
 	KeyPath     string `json:"key_path,omitempty"`
 	EncKey      []byte `json:"enc_key,omitempty"`
+	EncKeyPass  []byte `json:"enc_key_pass,omitempty"`
 }
 
 type Store struct {
@@ -163,6 +165,7 @@ func (h *Host) Normalize() {
 	if h.DefaultAuthType == "password" {
 		h.DefaultKeyPath = ""
 		h.DefaultEncKey = nil
+		h.DefaultEncKeyPass = nil
 	} else {
 		h.DefaultEncPassword = nil
 	}
@@ -199,10 +202,11 @@ func (h Host) AccountNames() []string {
 }
 
 type ResolvedAuth struct {
-	AuthType string
-	Password []byte
-	KeyPath  string
-	EncKey   []byte
+	AuthType   string
+	Password   []byte
+	KeyPath    string
+	EncKey     []byte
+	EncKeyPass []byte
 }
 
 func (h Host) ResolveAccount(username string) (HostUser, ResolvedAuth, bool) {
@@ -212,17 +216,19 @@ func (h Host) ResolveAccount(username string) (HostUser, ResolvedAuth, bool) {
 		}
 		if account.UseDefault {
 			return account, ResolvedAuth{
-				AuthType: h.DefaultAuthType,
-				Password: cloneBytes(h.DefaultEncPassword),
-				KeyPath:  h.DefaultKeyPath,
-				EncKey:   cloneBytes(h.DefaultEncKey),
+				AuthType:   h.DefaultAuthType,
+				Password:   cloneBytes(h.DefaultEncPassword),
+				KeyPath:    h.DefaultKeyPath,
+				EncKey:     cloneBytes(h.DefaultEncKey),
+				EncKeyPass: cloneBytes(h.DefaultEncKeyPass),
 			}, true
 		}
 		return account, ResolvedAuth{
-			AuthType: account.AuthType,
-			Password: cloneBytes(account.EncPassword),
-			KeyPath:  account.KeyPath,
-			EncKey:   cloneBytes(account.EncKey),
+			AuthType:   account.AuthType,
+			Password:   cloneBytes(account.EncPassword),
+			KeyPath:    account.KeyPath,
+			EncKey:     cloneBytes(account.EncKey),
+			EncKeyPass: cloneBytes(account.EncKeyPass),
 		}, true
 	}
 	return HostUser{}, ResolvedAuth{}, false
@@ -249,11 +255,13 @@ func normalizeAccounts(accounts []HostUser) []HostUser {
 			account.EncPassword = nil
 			account.KeyPath = ""
 			account.EncKey = nil
+			account.EncKeyPass = nil
 		} else {
 			account.UseDefault = false
 			if account.AuthType == "password" {
 				account.KeyPath = ""
 				account.EncKey = nil
+				account.EncKeyPass = nil
 			} else {
 				account.EncPassword = nil
 			}

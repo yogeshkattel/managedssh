@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -118,17 +119,48 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
-	m.phase = phaseDashboard
-	m.selectedHost = host.Host{}
-
-	var password []byte
-	var keyData []byte
-	var keyPath string
 	_, resolved, ok := h.ResolveAccount(user)
 	if !ok {
 		m.connErr = "Selected user is no longer available"
 		return m, nil
 	}
+
+	if resolved.AuthType == "key" && len(resolved.EncKeyPass) == 0 {
+		var keyData []byte
+		if len(resolved.EncKey) > 0 {
+			dec, err := vault.Decrypt(m.encKey, resolved.EncKey)
+			if err == nil {
+				keyData = dec
+			}
+		}
+		if err := sshclient.Verify(sshclient.VerifyConfig{
+			Host:    h.Hostname,
+			Port:    h.Port,
+			User:    user,
+			KeyPath: resolved.KeyPath,
+			KeyData: keyData,
+		}); err != nil {
+			zeroBytes(keyData)
+			var needPass *sshclient.KeyPassphraseRequiredError
+			if errors.As(err, &needPass) {
+				return m.startKeyPassphrasePrompt(h, user, resolved), nil
+			}
+		}
+		zeroBytes(keyData)
+	}
+
+	return m.connectSSHWithResolved(h, user, resolved, nil, false)
+}
+
+func (m model) connectSSHWithResolved(h host.Host, user string, resolved host.ResolvedAuth, promptPassphrase []byte, savePrompt bool) (tea.Model, tea.Cmd) {
+	m.phase = phaseDashboard
+	m.selectedHost = host.Host{}
+	m.connErr = ""
+
+	var password []byte
+	var keyData []byte
+	var keyPath string
+	var keyPassphrase []byte
 
 	if resolved.AuthType == "password" && len(resolved.Password) > 0 {
 		dec, err := vault.Decrypt(m.encKey, resolved.Password)
@@ -144,20 +176,49 @@ func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 				keyData = dec
 			}
 		}
+		if len(promptPassphrase) > 0 {
+			keyPassphrase = append([]byte(nil), promptPassphrase...)
+		} else if len(resolved.EncKeyPass) > 0 {
+			dec, err := vault.Decrypt(m.encKey, resolved.EncKeyPass)
+			if err == nil {
+				keyPassphrase = dec
+			}
+		}
 	}
 
 	sess := &sshclient.Session{
-		Host:     h.Hostname,
-		Port:     h.Port,
-		User:     user,
-		Password: password,
-		KeyPath:  keyPath,
-		KeyData:  keyData,
+		Host:          h.Hostname,
+		Port:          h.Port,
+		User:          user,
+		Password:      password,
+		KeyPath:       keyPath,
+		KeyData:       keyData,
+		KeyPassphrase: keyPassphrase,
 	}
+
+	m.connectHost = h
+	m.connectUser = user
+	m.connectResolved = resolved
+	m.pendingKeyPassSave = savePrompt
+	if !savePrompt {
+		zeroBytes(m.pendingKeyPassphrase)
+		m.pendingKeyPassphrase = nil
+	}
+	m.connectPassphraseInput.Reset()
 
 	return m, tea.Exec(sess, func(err error) tea.Msg {
 		return sshDoneMsg{err: err}
 	})
+}
+
+func (m model) startKeyPassphrasePrompt(h host.Host, user string, resolved host.ResolvedAuth) model {
+	m.phase = phaseKeyPassphrasePrompt
+	m.connectHost = h
+	m.connectUser = user
+	m.connectResolved = resolved
+	m.connectPassphraseInput = newKeyPassphraseInput()
+	m.connErr = ""
+	return m
 }
 
 func (m model) startUserSelect(h host.Host) model {

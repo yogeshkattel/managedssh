@@ -20,12 +20,13 @@ import (
 )
 
 type VerifyConfig struct {
-	Host     string
-	Port     int
-	User     string
-	Password []byte
-	KeyPath  string
-	KeyData  []byte
+	Host          string
+	Port          int
+	User          string
+	Password      []byte
+	KeyPath       string
+	KeyData       []byte
+	KeyPassphrase []byte
 }
 
 type UnknownHostError struct {
@@ -36,6 +37,12 @@ type UnknownHostError struct {
 	KnownHostsLine string
 }
 
+type KeyPassphraseRequiredError struct{}
+
+func (e *KeyPassphraseRequiredError) Error() string {
+	return "SSH key requires a passphrase"
+}
+
 func (e *UnknownHostError) Error() string {
 	return fmt.Sprintf("unknown host key for %s (%s)", e.Host, e.Fingerprint)
 }
@@ -43,12 +50,13 @@ func (e *UnknownHostError) Error() string {
 // Session implements bubbletea.ExecCommand so it can be handed
 // the terminal via tea.Exec while the SSH session is active.
 type Session struct {
-	Host     string
-	Port     int
-	User     string
-	Password []byte
-	KeyPath  string
-	KeyData  []byte
+	Host          string
+	Port          int
+	User          string
+	Password      []byte
+	KeyPath       string
+	KeyData       []byte
+	KeyPassphrase []byte
 
 	stdin  io.Reader
 	stdout io.Writer
@@ -62,8 +70,9 @@ func (s *Session) SetStderr(w io.Writer) { s.stderr = w }
 func (s *Session) Run() error {
 	defer s.zeroPassword()
 	defer s.zeroKeyData()
+	defer s.zeroKeyPassphrase()
 
-	authMethods, err := buildAuthMethods(s.Password, s.KeyPath, s.KeyData)
+	authMethods, err := buildAuthMethods(s.Password, s.KeyPath, s.KeyData, s.KeyPassphrase)
 	if err != nil {
 		return err
 	}
@@ -159,6 +168,13 @@ func (s *Session) zeroKeyData() {
 	s.KeyData = nil
 }
 
+func (s *Session) zeroKeyPassphrase() {
+	for i := range s.KeyPassphrase {
+		s.KeyPassphrase[i] = 0
+	}
+	s.KeyPassphrase = nil
+}
+
 // buildHostKeyCallback loads ~/.ssh/known_hosts for host key verification.
 // If the file doesn't exist yet it is created so future connections are
 // verified (trust-on-first-use will be handled by the ssh library's error
@@ -220,7 +236,7 @@ type authWithCleanup struct {
 	conn   net.Conn
 }
 
-func buildAuthMethods(password []byte, keyPath string, keyData []byte) ([]authWithCleanup, error) {
+func buildAuthMethods(password []byte, keyPath string, keyData []byte, keyPassphrase []byte) ([]authWithCleanup, error) {
 	var authMethods []authWithCleanup
 
 	if len(password) > 0 {
@@ -241,7 +257,7 @@ func buildAuthMethods(password []byte, keyPath string, keyData []byte) ([]authWi
 		})
 	}
 
-	if signer, err := loadConfiguredKey(keyPath, keyData); err != nil {
+	if signer, err := loadConfiguredKey(keyPath, keyData, keyPassphrase); err != nil {
 		return nil, err
 	} else if signer != nil {
 		authMethods = append(authMethods, authWithCleanup{method: ssh.PublicKeys(signer)})
@@ -311,14 +327,10 @@ func loadKeyFiles() []ssh.Signer {
 	return signers
 }
 
-func loadConfiguredKey(path string, keyData []byte) (ssh.Signer, error) {
+func loadConfiguredKey(path string, keyData []byte, keyPassphrase []byte) (ssh.Signer, error) {
 	switch {
 	case len(keyData) > 0:
-		signer, err := ssh.ParsePrivateKey(keyData)
-		if err != nil {
-			return nil, fmt.Errorf("configured SSH key is invalid: %w", err)
-		}
-		return signer, nil
+		return parseConfiguredKey(keyData, keyPassphrase)
 	case path != "":
 		path = expandUserPath(path)
 		info, err := os.Stat(path)
@@ -332,18 +344,33 @@ func loadConfiguredKey(path string, keyData []byte) (ssh.Signer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("configured SSH key read failed: %w", err)
 		}
-		signer, err := ssh.ParsePrivateKey(data)
-		if err != nil {
-			return nil, fmt.Errorf("configured SSH key is invalid: %w", err)
-		}
-		return signer, nil
+		return parseConfiguredKey(data, keyPassphrase)
 	default:
 		return nil, nil
 	}
 }
 
+func parseConfiguredKey(keyData []byte, keyPassphrase []byte) (ssh.Signer, error) {
+	signer, err := ssh.ParsePrivateKey(keyData)
+	if err == nil {
+		return signer, nil
+	}
+	var missing *ssh.PassphraseMissingError
+	if errors.As(err, &missing) {
+		if len(keyPassphrase) == 0 {
+			return nil, &KeyPassphraseRequiredError{}
+		}
+		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyData, keyPassphrase)
+		if err != nil {
+			return nil, fmt.Errorf("configured SSH key passphrase is invalid: %w", err)
+		}
+		return signer, nil
+	}
+	return nil, fmt.Errorf("configured SSH key is invalid: %w", err)
+}
+
 func Verify(cfg VerifyConfig) error {
-	authMethods, err := buildAuthMethods(cfg.Password, cfg.KeyPath, cfg.KeyData)
+	authMethods, err := buildAuthMethods(cfg.Password, cfg.KeyPath, cfg.KeyData, cfg.KeyPassphrase)
 	if err != nil {
 		return err
 	}
