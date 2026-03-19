@@ -238,6 +238,7 @@ func loadConfiguredKey(path string, keyData []byte) (ssh.Signer, error) {
 		}
 		return signer, nil
 	case path != "":
+		path = expandUserPath(path)
 		info, err := os.Stat(path)
 		if err != nil {
 			return nil, fmt.Errorf("configured SSH key path failed: %w", err)
@@ -257,4 +258,17 @@ func loadConfiguredKey(path string, keyData []byte) (ssh.Signer, error) {
 	default:
 		return nil, nil
 	}
+}
+
+func expandUserPath(path string) string {
+	if path == "~" || len(path) > 2 && path[:2] == "~/" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			if path == "~" {
+				return home
+			}
+			return filepath.Join(home, path[2:])
+		}
+	}
+	return path
 }
