@@ -392,22 +392,12 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 		h.Accounts = append(h.Accounts, account)
 	}
 
-	if m.formEditing != "" {
-		if err := m.store.Update(m.formEditing, h); err != nil {
-			m.formErr = "Failed to save: " + err.Error()
-			return m, nil
-		}
-	} else {
-		if err := m.store.Add(h); err != nil {
-			m.formErr = "Failed to save: " + err.Error()
-			return m, nil
-		}
-	}
-
-	m.phase = phaseDashboard
+	m.pendingHost = h
+	m.pendingEditID = m.formEditing
+	m.pendingTrust = nil
+	m.phase = phaseHostVerifying
 	m.formErr = ""
-	m = m.refreshFiltered()
-	return m, nil
+	return m, verifyHostCmd(h, m.encKey)
 }
 
 // ------------------------------------------------------------------

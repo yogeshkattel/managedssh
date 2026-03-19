@@ -1,6 +1,7 @@
 package sshclient
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +18,27 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/term"
 )
+
+type VerifyConfig struct {
+	Host     string
+	Port     int
+	User     string
+	Password []byte
+	KeyPath  string
+	KeyData  []byte
+}
+
+type UnknownHostError struct {
+	Host           string
+	Address        string
+	KeyType        string
+	Fingerprint    string
+	KnownHostsLine string
+}
+
+func (e *UnknownHostError) Error() string {
+	return fmt.Sprintf("unknown host key for %s (%s)", e.Host, e.Fingerprint)
+}
 
 // Session implements bubbletea.ExecCommand so it can be handed
 // the terminal via tea.Exec while the SSH session is active.
@@ -40,40 +63,11 @@ func (s *Session) Run() error {
 	defer s.zeroPassword()
 	defer s.zeroKeyData()
 
-	var authMethods []ssh.AuthMethod
-
-	if len(s.Password) > 0 {
-		pw := string(s.Password)
-		authMethods = append(authMethods, ssh.Password(pw))
-		authMethods = append(authMethods, ssh.KeyboardInteractive(
-			func(_, _ string, questions []string, echos []bool) ([]string, error) {
-				answers := make([]string, len(questions))
-				if len(questions) == 1 && !echos[0] {
-					answers[0] = pw
-				}
-				return answers, nil
-			},
-		))
-	}
-
-	if signer, err := loadConfiguredKey(s.KeyPath, s.KeyData); err != nil {
+	authMethods, err := buildAuthMethods(s.Password, s.KeyPath, s.KeyData)
+	if err != nil {
 		return err
-	} else if signer != nil {
-		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
-
-	if agentAuth, conn := dialAgent(); agentAuth != nil {
-		defer conn.Close()
-		authMethods = append(authMethods, agentAuth)
-	}
-
-	if signers := loadKeyFiles(); len(signers) > 0 {
-		authMethods = append(authMethods, ssh.PublicKeys(signers...))
-	}
-
-	if len(authMethods) == 0 {
-		return fmt.Errorf("no authentication method available (no password, agent, or key files found)")
-	}
+	defer closeAuthResources(authMethods)
 
 	hostKeyCallback, err := buildHostKeyCallback()
 	if err != nil {
@@ -82,7 +76,7 @@ func (s *Session) Run() error {
 
 	config := &ssh.ClientConfig{
 		User:            s.User,
-		Auth:            authMethods,
+		Auth:            flattenAuthMethods(authMethods),
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         10 * time.Second,
 	}
@@ -186,6 +180,29 @@ func buildHostKeyCallback() (ssh.HostKeyCallback, error) {
 	return knownhosts.New(khPath)
 }
 
+func buildVerifyHostKeyCallback() (ssh.HostKeyCallback, error) {
+	base, err := buildHostKeyCallback()
+	if err != nil {
+		return nil, err
+	}
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		if err := base(hostname, remote, key); err != nil {
+			var keyErr *knownhosts.KeyError
+			if errors.As(err, &keyErr) && len(keyErr.Want) == 0 {
+				return &UnknownHostError{
+					Host:           stripKnownHostPort(hostname),
+					Address:        hostname,
+					KeyType:        key.Type(),
+					Fingerprint:    ssh.FingerprintSHA256(key),
+					KnownHostsLine: knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key),
+				}
+			}
+			return err
+		}
+		return nil
+	}, nil
+}
+
 func dialAgent() (ssh.AuthMethod, net.Conn) {
 	sock := os.Getenv("SSH_AUTH_SOCK")
 	if sock == "" {
@@ -196,6 +213,71 @@ func dialAgent() (ssh.AuthMethod, net.Conn) {
 		return nil, nil
 	}
 	return ssh.PublicKeysCallback(agent.NewClient(conn).Signers), conn
+}
+
+type authWithCleanup struct {
+	method ssh.AuthMethod
+	conn   net.Conn
+}
+
+func buildAuthMethods(password []byte, keyPath string, keyData []byte) ([]authWithCleanup, error) {
+	var authMethods []authWithCleanup
+
+	if len(password) > 0 {
+		pw := string(password)
+		authMethods = append(authMethods, authWithCleanup{
+			method: ssh.Password(pw),
+		})
+		authMethods = append(authMethods, authWithCleanup{
+			method: ssh.KeyboardInteractive(
+				func(_, _ string, questions []string, echos []bool) ([]string, error) {
+					answers := make([]string, len(questions))
+					if len(questions) == 1 && !echos[0] {
+						answers[0] = pw
+					}
+					return answers, nil
+				},
+			),
+		})
+	}
+
+	if signer, err := loadConfiguredKey(keyPath, keyData); err != nil {
+		return nil, err
+	} else if signer != nil {
+		authMethods = append(authMethods, authWithCleanup{method: ssh.PublicKeys(signer)})
+	}
+
+	if agentAuth, conn := dialAgent(); agentAuth != nil {
+		authMethods = append(authMethods, authWithCleanup{
+			method: agentAuth,
+			conn:   conn,
+		})
+	}
+
+	if signers := loadKeyFiles(); len(signers) > 0 {
+		authMethods = append(authMethods, authWithCleanup{method: ssh.PublicKeys(signers...)})
+	}
+
+	if len(authMethods) == 0 {
+		return nil, fmt.Errorf("no authentication method available (no password, agent, or key files found)")
+	}
+	return authMethods, nil
+}
+
+func closeAuthResources(methods []authWithCleanup) {
+	for _, method := range methods {
+		if method.conn != nil {
+			_ = method.conn.Close()
+		}
+	}
+}
+
+func flattenAuthMethods(methods []authWithCleanup) []ssh.AuthMethod {
+	out := make([]ssh.AuthMethod, 0, len(methods))
+	for _, method := range methods {
+		out = append(out, method.method)
+	}
+	return out
 }
 
 func loadKeyFiles() []ssh.Signer {
@@ -260,6 +342,63 @@ func loadConfiguredKey(path string, keyData []byte) (ssh.Signer, error) {
 	}
 }
 
+func Verify(cfg VerifyConfig) error {
+	authMethods, err := buildAuthMethods(cfg.Password, cfg.KeyPath, cfg.KeyData)
+	if err != nil {
+		return err
+	}
+	defer closeAuthResources(authMethods)
+
+	hostKeyCallback, err := buildVerifyHostKeyCallback()
+	if err != nil {
+		return fmt.Errorf("known_hosts setup failed: %w", err)
+	}
+
+	config := &ssh.ClientConfig{
+		User:            cfg.User,
+		Auth:            flattenAuthMethods(authMethods),
+		HostKeyCallback: hostKeyCallback,
+		Timeout:         10 * time.Second,
+	}
+
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+	client, err := ssh.Dial("tcp", addr, config)
+	if err != nil {
+		return err
+	}
+	return client.Close()
+}
+
+func TrustHostKey(err *UnknownHostError) error {
+	if err == nil || err.KnownHostsLine == "" {
+		return fmt.Errorf("missing host key to trust")
+	}
+	khPath, readErr := ensureKnownHostsFile()
+	if readErr != nil {
+		return readErr
+	}
+
+	data, readErr := os.ReadFile(khPath)
+	if readErr == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(line) == strings.TrimSpace(err.KnownHostsLine) {
+				return nil
+			}
+		}
+	}
+
+	f, openErr := os.OpenFile(khPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if openErr != nil {
+		return openErr
+	}
+	defer f.Close()
+
+	if _, writeErr := fmt.Fprintln(f, err.KnownHostsLine); writeErr != nil {
+		return writeErr
+	}
+	return nil
+}
+
 func expandUserPath(path string) string {
 	if path == "~" || len(path) > 2 && path[:2] == "~/" {
 		home, err := os.UserHomeDir()
@@ -271,4 +410,33 @@ func expandUserPath(path string) string {
 		}
 	}
 	return path
+}
+
+func ensureKnownHostsFile() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	khPath := filepath.Join(home, ".ssh", "known_hosts")
+	if _, err := os.Stat(khPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(khPath), 0700); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(khPath, nil, 0600); err != nil {
+			return "", err
+		}
+	}
+	return khPath, nil
+}
+
+func stripKnownHostPort(host string) string {
+	if strings.HasPrefix(host, "[") && strings.Contains(host, "]:") {
+		if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+			return parsedHost
+		}
+	}
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		return parsedHost
+	}
+	return host
 }
