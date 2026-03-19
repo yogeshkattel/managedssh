@@ -36,25 +36,42 @@ func TestResolveAccountPrefersUserOverride(t *testing.T) {
 		DefaultEncPassword: []byte("host-secret"),
 		Accounts: []HostUser{
 			{Username: "root", UseDefault: true},
-			{Username: "deploy", AuthType: "key"},
+			{Username: "deploy", AuthType: "key", KeyPath: "/tmp/deploy-key"},
 			{Username: "backup", AuthType: "password", EncPassword: []byte("backup-secret")},
 		},
 	}
 
 	h.Normalize()
 
-	_, authType, password, ok := h.ResolveAccount("root")
-	if !ok || authType != "password" || string(password) != "host-secret" {
-		t.Fatalf("unexpected default account resolution: ok=%v auth=%q password=%q", ok, authType, string(password))
+	_, resolved, ok := h.ResolveAccount("root")
+	if !ok || resolved.AuthType != "password" || string(resolved.Password) != "host-secret" {
+		t.Fatalf("unexpected default account resolution: ok=%v auth=%q password=%q", ok, resolved.AuthType, string(resolved.Password))
 	}
 
-	_, authType, password, ok = h.ResolveAccount("deploy")
-	if !ok || authType != "key" || len(password) != 0 {
-		t.Fatalf("unexpected key override resolution: ok=%v auth=%q password=%q", ok, authType, string(password))
+	_, resolved, ok = h.ResolveAccount("deploy")
+	if !ok || resolved.AuthType != "key" || resolved.KeyPath != "/tmp/deploy-key" || len(resolved.EncKey) != 0 {
+		t.Fatalf("unexpected key override resolution: ok=%v auth=%q key_path=%q enc_key=%d", ok, resolved.AuthType, resolved.KeyPath, len(resolved.EncKey))
 	}
 
-	_, authType, password, ok = h.ResolveAccount("backup")
-	if !ok || authType != "password" || string(password) != "backup-secret" {
-		t.Fatalf("unexpected password override resolution: ok=%v auth=%q password=%q", ok, authType, string(password))
+	_, resolved, ok = h.ResolveAccount("backup")
+	if !ok || resolved.AuthType != "password" || string(resolved.Password) != "backup-secret" {
+		t.Fatalf("unexpected password override resolution: ok=%v auth=%q password=%q", ok, resolved.AuthType, string(resolved.Password))
+	}
+}
+
+func TestResolveAccountReturnsDefaultInlineKey(t *testing.T) {
+	h := Host{
+		DefaultAuthType: "key",
+		DefaultEncKey:   []byte("inline-key"),
+		Accounts: []HostUser{
+			{Username: "root", UseDefault: true},
+		},
+	}
+
+	h.Normalize()
+
+	_, resolved, ok := h.ResolveAccount("root")
+	if !ok || resolved.AuthType != "key" || string(resolved.EncKey) != "inline-key" {
+		t.Fatalf("unexpected default key resolution: ok=%v auth=%q enc_key=%q", ok, resolved.AuthType, string(resolved.EncKey))
 	}
 }

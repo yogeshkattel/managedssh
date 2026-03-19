@@ -24,6 +24,8 @@ type Session struct {
 	Port     int
 	User     string
 	Password []byte
+	KeyPath  string
+	KeyData  []byte
 
 	stdin  io.Reader
 	stdout io.Writer
@@ -36,6 +38,7 @@ func (s *Session) SetStderr(w io.Writer) { s.stderr = w }
 
 func (s *Session) Run() error {
 	defer s.zeroPassword()
+	defer s.zeroKeyData()
 
 	var authMethods []ssh.AuthMethod
 
@@ -51,6 +54,12 @@ func (s *Session) Run() error {
 				return answers, nil
 			},
 		))
+	}
+
+	if signer, err := loadConfiguredKey(s.KeyPath, s.KeyData); err != nil {
+		return err
+	} else if signer != nil {
+		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
 
 	if agentAuth, conn := dialAgent(); agentAuth != nil {
@@ -149,6 +158,13 @@ func (s *Session) zeroPassword() {
 	s.Password = nil
 }
 
+func (s *Session) zeroKeyData() {
+	for i := range s.KeyData {
+		s.KeyData[i] = 0
+	}
+	s.KeyData = nil
+}
+
 // buildHostKeyCallback loads ~/.ssh/known_hosts for host key verification.
 // If the file doesn't exist yet it is created so future connections are
 // verified (trust-on-first-use will be handled by the ssh library's error
@@ -211,4 +227,34 @@ func loadKeyFiles() []ssh.Signer {
 		signers = append(signers, signer)
 	}
 	return signers
+}
+
+func loadConfiguredKey(path string, keyData []byte) (ssh.Signer, error) {
+	switch {
+	case len(keyData) > 0:
+		signer, err := ssh.ParsePrivateKey(keyData)
+		if err != nil {
+			return nil, fmt.Errorf("configured SSH key is invalid: %w", err)
+		}
+		return signer, nil
+	case path != "":
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("configured SSH key path failed: %w", err)
+		}
+		if perm := info.Mode().Perm(); perm&0077 != 0 {
+			return nil, fmt.Errorf("configured SSH key permissions are too open")
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("configured SSH key read failed: %w", err)
+		}
+		signer, err := ssh.ParsePrivateKey(data)
+		if err != nil {
+			return nil, fmt.Errorf("configured SSH key is invalid: %w", err)
+		}
+		return signer, nil
+	default:
+		return nil, nil
+	}
 }

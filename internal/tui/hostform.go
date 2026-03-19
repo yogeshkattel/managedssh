@@ -2,6 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -20,10 +23,10 @@ const (
 	fUsers
 	fPort
 	fDefaultAuth
-	fDefaultPassword
+	fDefaultCredential
 	fSelectedUser
 	fSelectedUserAuth
-	fSelectedUserPassword
+	fSelectedUserCredential
 )
 
 func formInputIdx(focus int) int {
@@ -36,9 +39,9 @@ func formInputIdx(focus int) int {
 		return 2
 	case fPort:
 		return 3
-	case fDefaultPassword:
+	case fDefaultCredential:
 		return 4
-	case fSelectedUserPassword:
+	case fSelectedUserCredential:
 		return 5
 	default:
 		return -1
@@ -71,16 +74,12 @@ func newHostFormInputs(alias, hostname, users string, port int) []textinput.Mode
 
 	inputs[4] = textinput.New()
 	inputs[4].Placeholder = "Default password"
-	inputs[4].EchoMode = textinput.EchoPassword
-	inputs[4].EchoCharacter = '•'
-	inputs[4].CharLimit = 128
+	inputs[4].CharLimit = 4096
 	inputs[4].Width = 36
 
 	inputs[5] = textinput.New()
 	inputs[5].Placeholder = "Override password"
-	inputs[5].EchoMode = textinput.EchoPassword
-	inputs[5].EchoCharacter = '•'
-	inputs[5].CharLimit = 128
+	inputs[5].CharLimit = 4096
 	inputs[5].Width = 36
 
 	inputs[0].SetValue(alias)
@@ -99,9 +98,15 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 	m.formFocus = fAlias
 	m.formErr = ""
 	m.formDefaultAuth = "key"
+	m.formDefaultPassword = ""
 	m.formDefaultEncPassword = nil
+	m.formDefaultKeyValue = ""
+	m.formDefaultKeyPath = ""
+	m.formDefaultEncKey = nil
 	m.formUserConfigs = nil
 	m.formUserCursor = 0
+	m.formPathSuggestions = nil
+	m.formPathSuggestIndex = 0
 
 	var alias, hostname, users string
 	var port int
@@ -116,13 +121,22 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 			port = h.Port
 			m.formDefaultAuth = h.DefaultAuthType
 			m.formDefaultEncPassword = cloneFormBytes(h.DefaultEncPassword)
+			m.formDefaultKeyPath = h.DefaultKeyPath
+			m.formDefaultEncKey = cloneFormBytes(h.DefaultEncKey)
+			if h.DefaultKeyPath != "" {
+				m.formDefaultKeyValue = h.DefaultKeyPath
+			}
 			m.formUserConfigs = make([]formUserConfig, 0, len(h.Accounts))
 			for _, account := range h.Accounts {
+				keyValue := account.KeyPath
 				m.formUserConfigs = append(m.formUserConfigs, formUserConfig{
 					Username:            account.Username,
 					UseDefault:          account.UseDefault,
 					AuthType:            account.AuthType,
 					ExistingEncPassword: cloneFormBytes(account.EncPassword),
+					KeyValue:            keyValue,
+					ExistingKeyPath:     account.KeyPath,
+					ExistingEncKey:      cloneFormBytes(account.EncKey),
 				})
 			}
 			break
@@ -130,6 +144,7 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 	}
 
 	m.formInputs = newHostFormInputs(alias, hostname, users, port)
+	m.loadDefaultCredentialInput()
 	m.syncFormUsers()
 	return m, textinput.Blink
 }
@@ -145,10 +160,23 @@ func (m model) updateHostForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.phase = phaseDashboard
 			m = m.refreshFiltered()
 			return m, nil
-		case "tab", "down":
+		case "tab":
+			if m.acceptPathSuggestion() {
+				return m, nil
+			}
+			return m.cycleFormFocus(1)
+		case "down":
 			return m.cycleFormFocus(1)
 		case "shift+tab", "up":
 			return m.cycleFormFocus(-1)
+		case "ctrl+n":
+			if m.cyclePathSuggestion(1) {
+				return m, nil
+			}
+		case "ctrl+p":
+			if m.cyclePathSuggestion(-1) {
+				return m, nil
+			}
 		case "left", "h":
 			switch m.formFocus {
 			case fSelectedUser:
@@ -184,8 +212,16 @@ func (m model) updateHostForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.formFocus {
 		case fUsers:
 			m.syncFormUsers()
-		case fSelectedUserPassword:
-			m.storeSelectedUserPasswordInput()
+		case fDefaultCredential:
+			if m.formDefaultAuth == "password" {
+				m.formDefaultPassword = m.formInputs[4].Value()
+			} else {
+				m.storeDefaultCredentialInput()
+			}
+			m.refreshPathSuggestions()
+		case fSelectedUserCredential:
+			m.storeSelectedUserCredentialInput()
+			m.refreshPathSuggestions()
 		}
 		return m, cmd
 	}
@@ -215,24 +251,27 @@ func (m model) cycleFormFocus(dir int) (tea.Model, tea.Cmd) {
 	m.formFocus = focuses[cur]
 
 	if idx := formInputIdx(m.formFocus); idx >= 0 {
+		m.refreshPathSuggestions()
 		m.formInputs[idx].Focus()
 		return m, textinput.Blink
 	}
+	m.formPathSuggestions = nil
+	m.formPathSuggestIndex = 0
 	return m, nil
 }
 
 func (m model) activeFormFocuses() []int {
 	focuses := []int{fAlias, fHostname, fUsers, fPort, fDefaultAuth}
-	if m.formDefaultAuth == "password" {
-		focuses = append(focuses, fDefaultPassword)
+	if m.formDefaultAuth == "password" || m.formDefaultAuth == "key" {
+		focuses = append(focuses, fDefaultCredential)
 	}
 	if len(m.formUserConfigs) == 0 {
 		return focuses
 	}
 
 	focuses = append(focuses, fSelectedUser, fSelectedUserAuth)
-	if user := m.currentFormUser(); user != nil && !user.UseDefault && user.AuthType == "password" {
-		focuses = append(focuses, fSelectedUserPassword)
+	if user := m.currentFormUser(); user != nil && !user.UseDefault && (user.AuthType == "password" || user.AuthType == "key") {
+		focuses = append(focuses, fSelectedUserCredential)
 	}
 	return focuses
 }
@@ -242,7 +281,7 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 	hostname := strings.TrimSpace(m.formInputs[1].Value())
 	users := parseUsers(m.formInputs[2].Value())
 	portStr := strings.TrimSpace(m.formInputs[3].Value())
-	defaultPassword := m.formInputs[4].Value()
+	defaultCredential := m.formInputs[4].Value()
 
 	if alias == "" {
 		m.formErr = "Alias is required"
@@ -277,8 +316,8 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 
 	if m.formDefaultAuth == "password" {
 		switch {
-		case defaultPassword != "":
-			enc, err := vault.Encrypt(m.encKey, []byte(defaultPassword))
+		case defaultCredential != "":
+			enc, err := vault.Encrypt(m.encKey, []byte(defaultCredential))
 			if err != nil {
 				m.formErr = "Failed to encrypt default password: " + err.Error()
 				return m, nil
@@ -289,6 +328,23 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 		default:
 			m.formErr = "Default password is required for password auth"
 			return m, nil
+		}
+	} else {
+		keyPath, keyPlain := splitKeyValue(defaultCredential)
+		switch {
+		case keyPath != "":
+			h.DefaultKeyPath = keyPath
+		case keyPlain != "":
+			enc, err := vault.Encrypt(m.encKey, []byte(keyPlain))
+			if err != nil {
+				m.formErr = "Failed to encrypt default SSH key: " + err.Error()
+				return m, nil
+			}
+			h.DefaultEncKey = enc
+		case m.formDefaultKeyPath != "":
+			h.DefaultKeyPath = m.formDefaultKeyPath
+		case len(m.formDefaultEncKey) > 0:
+			h.DefaultEncKey = cloneFormBytes(m.formDefaultEncKey)
 		}
 	}
 
@@ -313,6 +369,23 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 				default:
 					m.formErr = "Override password is required for " + cfg.Username
 					return m, nil
+				}
+			} else {
+				keyPath, keyPlain := splitKeyValue(cfg.KeyValue)
+				switch {
+				case keyPath != "":
+					account.KeyPath = keyPath
+				case keyPlain != "":
+					enc, err := vault.Encrypt(m.encKey, []byte(keyPlain))
+					if err != nil {
+						m.formErr = "Failed to encrypt SSH key for " + cfg.Username + ": " + err.Error()
+						return m, nil
+					}
+					account.EncKey = enc
+				case cfg.ExistingKeyPath != "":
+					account.KeyPath = cfg.ExistingKeyPath
+				case len(cfg.ExistingEncKey) > 0:
+					account.EncKey = cloneFormBytes(cfg.ExistingEncKey)
 				}
 			}
 		}
@@ -396,13 +469,27 @@ func (m model) renderDefaultAuthSection() string {
 	if m.formDefaultAuth == "password" {
 		fieldLabel := "Default Password"
 		renderLabel := inputLabelStyle.Render(fieldLabel)
-		if m.formFocus == fDefaultPassword {
+		if m.formFocus == fDefaultCredential {
 			renderLabel = focusedLabel("▸ " + fieldLabel)
 		}
 		b.WriteString(renderLabel + "\n")
 		b.WriteString(m.formInputs[4].View() + "\n")
 		if m.formEditing != "" && len(m.formDefaultEncPassword) > 0 {
 			b.WriteString(hintStyle.Render("  Leave empty to keep the current default password") + "\n")
+		}
+		b.WriteString("\n")
+	} else {
+		fieldLabel := "Default SSH Key"
+		renderLabel := inputLabelStyle.Render(fieldLabel)
+		if m.formFocus == fDefaultCredential {
+			renderLabel = focusedLabel("▸ " + fieldLabel)
+		}
+		b.WriteString(renderLabel + "\n")
+		b.WriteString(m.formInputs[4].View() + "\n")
+		b.WriteString(hintStyle.Render("  Enter a key path or paste private key text. Use \\n for new lines if needed.") + "\n")
+		b.WriteString(m.renderPathSuggestions())
+		if m.formEditing != "" && hasDefaultKey(m) {
+			b.WriteString(hintStyle.Render("  Leave empty to keep the current default SSH key") + "\n")
 		}
 		b.WriteString("\n")
 	}
@@ -445,13 +532,27 @@ func (m model) renderSelectedUserSection() string {
 	if !user.UseDefault && user.AuthType == "password" {
 		fieldLabel := "Override Password"
 		renderLabel := inputLabelStyle.Render(fieldLabel)
-		if m.formFocus == fSelectedUserPassword {
+		if m.formFocus == fSelectedUserCredential {
 			renderLabel = focusedLabel("▸ " + fieldLabel)
 		}
 		b.WriteString(renderLabel + "\n")
 		b.WriteString(m.formInputs[5].View() + "\n")
 		if m.formEditing != "" && len(user.ExistingEncPassword) > 0 {
 			b.WriteString(hintStyle.Render("  Leave empty to keep the current password for this user") + "\n")
+		}
+		b.WriteString("\n")
+	} else if !user.UseDefault && user.AuthType == "key" {
+		fieldLabel := "Override SSH Key"
+		renderLabel := inputLabelStyle.Render(fieldLabel)
+		if m.formFocus == fSelectedUserCredential {
+			renderLabel = focusedLabel("▸ " + fieldLabel)
+		}
+		b.WriteString(renderLabel + "\n")
+		b.WriteString(m.formInputs[5].View() + "\n")
+		b.WriteString(hintStyle.Render("  Enter a key path or paste private key text. Use \\n for new lines if needed.") + "\n")
+		b.WriteString(m.renderPathSuggestions())
+		if m.formEditing != "" && (user.ExistingKeyPath != "" || len(user.ExistingEncKey) > 0) {
+			b.WriteString(hintStyle.Render("  Leave empty to keep the current SSH key for this user") + "\n")
 		}
 		b.WriteString("\n")
 	}
@@ -501,9 +602,13 @@ func focusedLabel(label string) string {
 func (m *model) selectDefaultAuth(dir int) {
 	if dir < 0 {
 		m.formDefaultAuth = "key"
+		m.loadDefaultCredentialInput()
+		m.refreshPathSuggestions()
 		return
 	}
 	m.formDefaultAuth = "password"
+	m.loadDefaultCredentialInput()
+	m.refreshPathSuggestions()
 }
 
 func (m *model) selectSelectedUserAuth(dir int) {
@@ -534,16 +639,18 @@ func (m *model) selectSelectedUserAuth(dir int) {
 	index = (index + dir + len(options)) % len(options)
 	user.UseDefault = options[index].useDefault
 	user.AuthType = options[index].authType
-	m.loadSelectedUserPasswordInput()
+	m.loadSelectedUserCredentialInput()
+	m.refreshPathSuggestions()
 }
 
 func (m *model) selectFormUser(delta int) {
 	if len(m.formUserConfigs) == 0 {
 		return
 	}
-	m.storeSelectedUserPasswordInput()
+	m.storeSelectedUserCredentialInput()
 	m.formUserCursor = (m.formUserCursor + delta + len(m.formUserConfigs)) % len(m.formUserConfigs)
-	m.loadSelectedUserPasswordInput()
+	m.loadSelectedUserCredentialInput()
+	m.refreshPathSuggestions()
 }
 
 func (m *model) currentFormUser() *formUserConfig {
@@ -583,29 +690,95 @@ func (m *model) syncFormUsers() {
 	if len(m.formUserConfigs) == 0 {
 		m.formUserCursor = 0
 		m.formInputs[5].SetValue("")
+		m.refreshPathSuggestions()
 		return
 	}
 	if m.formUserCursor >= len(m.formUserConfigs) {
 		m.formUserCursor = len(m.formUserConfigs) - 1
 	}
-	m.loadSelectedUserPasswordInput()
+	m.loadSelectedUserCredentialInput()
+	m.refreshPathSuggestions()
 }
 
-func (m *model) loadSelectedUserPasswordInput() {
+func (m *model) loadDefaultCredentialInput() {
+	configureCredentialInput(&m.formInputs[4], m.formDefaultAuth, "Default")
+	if m.formDefaultAuth == "password" {
+		m.formInputs[4].SetValue(m.formDefaultPassword)
+		m.refreshPathSuggestions()
+		return
+	}
+	m.formInputs[4].SetValue(m.formDefaultKeyValue)
+	m.refreshPathSuggestions()
+}
+
+func (m *model) storeDefaultCredentialInput() {
+	if m.formDefaultAuth == "password" {
+		return
+	}
+	m.formDefaultKeyValue = strings.TrimSpace(m.formInputs[4].Value())
+}
+
+func (m *model) loadSelectedUserCredentialInput() {
 	user := m.currentFormUser()
 	if user == nil {
 		m.formInputs[5].SetValue("")
+		m.refreshPathSuggestions()
 		return
 	}
-	m.formInputs[5].SetValue(user.Password)
+	configureCredentialInput(&m.formInputs[5], user.AuthType, "Override")
+	switch user.AuthType {
+	case "password":
+		m.formInputs[5].SetValue(user.Password)
+	case "key":
+		m.formInputs[5].SetValue(user.KeyValue)
+	default:
+		m.formInputs[5].SetValue("")
+	}
+	m.refreshPathSuggestions()
 }
 
-func (m *model) storeSelectedUserPasswordInput() {
+func (m *model) storeSelectedUserCredentialInput() {
 	user := m.currentFormUser()
 	if user == nil {
 		return
 	}
-	user.Password = m.formInputs[5].Value()
+	switch user.AuthType {
+	case "password":
+		user.Password = m.formInputs[5].Value()
+	case "key":
+		user.KeyValue = strings.TrimSpace(m.formInputs[5].Value())
+	}
+}
+
+func configureCredentialInput(input *textinput.Model, authType, label string) {
+	input.CharLimit = 4096
+	input.Width = 36
+	if authType == "password" {
+		input.Placeholder = label + " password"
+		input.EchoMode = textinput.EchoPassword
+		input.EchoCharacter = '•'
+		return
+	}
+	input.Placeholder = label + " SSH key path or private key"
+	input.EchoMode = textinput.EchoNormal
+}
+
+func (m model) renderPathSuggestions() string {
+	if len(m.formPathSuggestions) == 0 {
+		return ""
+	}
+	var lines []string
+	lines = append(lines, hintStyle.Render("  Path suggestions: tab accept • ctrl+n/ctrl+p move"))
+	for i, suggestion := range m.formPathSuggestions {
+		line := "  " + suggestion
+		if i == m.formPathSuggestIndex {
+			line = "  " + selectedChip(suggestion)
+		} else {
+			line = hintStyle.Render(line)
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func parseUsers(raw string) []string {
@@ -624,6 +797,150 @@ func parseUsers(raw string) []string {
 		out = append(out, part)
 	}
 	return out
+}
+
+func splitKeyValue(raw string) (string, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
+	}
+	if strings.Contains(raw, "BEGIN ") || strings.Contains(raw, "\\n") {
+		return "", strings.ReplaceAll(raw, "\\n", "\n")
+	}
+	return raw, ""
+}
+
+func (m *model) activePathInput() (*textinput.Model, bool) {
+	switch m.formFocus {
+	case fDefaultCredential:
+		if m.formDefaultAuth == "key" {
+			return &m.formInputs[4], true
+		}
+	case fSelectedUserCredential:
+		if user := m.currentFormUser(); user != nil && !user.UseDefault && user.AuthType == "key" {
+			return &m.formInputs[5], true
+		}
+	}
+	return nil, false
+}
+
+func (m *model) refreshPathSuggestions() {
+	input, ok := m.activePathInput()
+	if !ok {
+		m.formPathSuggestions = nil
+		m.formPathSuggestIndex = 0
+		return
+	}
+	suggestions := completePathSuggestions(strings.TrimSpace(input.Value()))
+	m.formPathSuggestions = suggestions
+	if len(suggestions) == 0 {
+		m.formPathSuggestIndex = 0
+		return
+	}
+	if m.formPathSuggestIndex >= len(suggestions) {
+		m.formPathSuggestIndex = 0
+	}
+}
+
+func (m *model) cyclePathSuggestion(delta int) bool {
+	if len(m.formPathSuggestions) == 0 {
+		return false
+	}
+	m.formPathSuggestIndex = (m.formPathSuggestIndex + delta + len(m.formPathSuggestions)) % len(m.formPathSuggestions)
+	return true
+}
+
+func (m *model) acceptPathSuggestion() bool {
+	input, ok := m.activePathInput()
+	if !ok || len(m.formPathSuggestions) == 0 {
+		return false
+	}
+	suggestion := m.formPathSuggestions[m.formPathSuggestIndex]
+	input.SetValue(suggestion)
+	switch m.formFocus {
+	case fDefaultCredential:
+		m.storeDefaultCredentialInput()
+	case fSelectedUserCredential:
+		m.storeSelectedUserCredentialInput()
+	}
+	m.refreshPathSuggestions()
+	return true
+}
+
+func completePathSuggestions(raw string) []string {
+	if raw == "" {
+		raw = "~/.ssh/"
+	}
+	if strings.Contains(raw, "BEGIN ") || strings.Contains(raw, "\\n") {
+		return nil
+	}
+
+	expanded := expandUserPath(raw)
+	dirPart := expanded
+	prefix := ""
+	if !strings.HasSuffix(expanded, string(os.PathSeparator)) {
+		dirPart = filepath.Dir(expanded)
+		prefix = filepath.Base(expanded)
+	}
+	if dirPart == "" {
+		dirPart = "."
+	}
+
+	entries, err := os.ReadDir(dirPart)
+	if err != nil {
+		return nil
+	}
+
+	var matches []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if prefix != "" && !strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
+			continue
+		}
+		full := filepath.Join(dirPart, name)
+		display := collapseUserPath(full)
+		if entry.IsDir() {
+			display += string(os.PathSeparator)
+		}
+		matches = append(matches, display)
+	}
+	sort.Strings(matches)
+	if len(matches) > 5 {
+		matches = matches[:5]
+	}
+	return matches
+}
+
+func expandUserPath(path string) string {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			if path == "~" {
+				return home
+			}
+			return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+		}
+	}
+	return path
+}
+
+func collapseUserPath(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if path == home {
+		return "~"
+	}
+	prefix := home + string(os.PathSeparator)
+	if strings.HasPrefix(path, prefix) {
+		return "~/" + strings.TrimPrefix(path, prefix)
+	}
+	return path
+}
+
+func hasDefaultKey(m model) bool {
+	return m.formDefaultKeyPath != "" || len(m.formDefaultEncKey) > 0
 }
 
 func cloneFormBytes(src []byte) []byte {

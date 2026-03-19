@@ -122,16 +122,27 @@ func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 	m.selectedHost = host.Host{}
 
 	var password []byte
-	_, authType, encPassword, ok := h.ResolveAccount(user)
+	var keyData []byte
+	var keyPath string
+	_, resolved, ok := h.ResolveAccount(user)
 	if !ok {
 		m.connErr = "Selected user is no longer available"
 		return m, nil
 	}
 
-	if authType == "password" && len(encPassword) > 0 {
-		dec, err := vault.Decrypt(m.encKey, encPassword)
+	if resolved.AuthType == "password" && len(resolved.Password) > 0 {
+		dec, err := vault.Decrypt(m.encKey, resolved.Password)
 		if err == nil {
 			password = dec
+		}
+	}
+	if resolved.AuthType == "key" {
+		keyPath = resolved.KeyPath
+		if len(resolved.EncKey) > 0 {
+			dec, err := vault.Decrypt(m.encKey, resolved.EncKey)
+			if err == nil {
+				keyData = dec
+			}
 		}
 	}
 
@@ -140,6 +151,8 @@ func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 		Port:     h.Port,
 		User:     user,
 		Password: password,
+		KeyPath:  keyPath,
+		KeyData:  keyData,
 	}
 
 	return m, tea.Exec(sess, func(err error) tea.Msg {
@@ -404,14 +417,14 @@ func summarizeAccountOverrides(h host.Host) string {
 }
 
 func userSummarySuffix(h host.Host, username string) string {
-	account, authType, _, ok := h.ResolveAccount(username)
+	account, resolved, ok := h.ResolveAccount(username)
 	if !ok {
 		return ""
 	}
 	if account.UseDefault {
 		return "  [default]"
 	}
-	if authType == "password" {
+	if resolved.AuthType == "password" {
 		return "  [password override]"
 	}
 	return "  [key override]"

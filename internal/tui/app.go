@@ -32,6 +32,9 @@ type formUserConfig struct {
 	AuthType            string
 	Password            string
 	ExistingEncPassword []byte
+	KeyValue            string
+	ExistingKeyPath     string
+	ExistingEncKey      []byte
 }
 
 type model struct {
@@ -64,9 +67,15 @@ type model struct {
 	formEditing            string
 	formErr                string
 	formDefaultAuth        string
+	formDefaultPassword    string
 	formDefaultEncPassword []byte
+	formDefaultKeyValue    string
+	formDefaultKeyPath     string
+	formDefaultEncKey      []byte
 	formUserConfigs        []formUserConfig
 	formUserCursor         int
+	formPathSuggestions    []string
+	formPathSuggestIndex   int
 }
 
 func zeroBytes(b []byte) {
