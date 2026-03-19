@@ -1,0 +1,35 @@
+# Binaries
+managedssh
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Credentials (never commit)
+*.enc
+credentials.enc
+backup/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation build
+docs/_build/
