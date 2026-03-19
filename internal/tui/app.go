@@ -20,6 +20,7 @@ const (
 	phaseUnlock
 	phaseDashboard
 	phaseHostForm
+	phaseUserSelect
 )
 
 // sshDoneMsg is sent after an SSH session completes (or fails).
@@ -46,6 +47,8 @@ type model struct {
 	searchFocused bool
 	confirmDelete bool
 	connErr       string
+	userCursor    int
+	selectedHost  host.Host
 
 	// Host form
 	formInputs   []textinput.Model
@@ -164,6 +167,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateDashboard(msg)
 	case phaseHostForm:
 		return m.updateHostForm(msg)
+	case phaseUserSelect:
+		return m.updateUserSelect(msg)
 	}
 	return m, nil
 }
@@ -185,6 +190,8 @@ func (m model) View() string {
 		return m.viewDashboard()
 	case phaseHostForm:
 		content = m.viewHostForm()
+	case phaseUserSelect:
+		content = m.viewUserSelect()
 	}
 
 	if m.width > 0 {

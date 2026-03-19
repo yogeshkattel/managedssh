@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/managedssh/managedssh/internal/host"
 	"github.com/managedssh/managedssh/internal/sshclient"
 	"github.com/managedssh/managedssh/internal/vault"
 )
@@ -101,14 +102,24 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		if len(m.filtered) > 0 {
-			return m.connectSSH()
+			h := m.filtered[m.hostCursor]
+			users := h.UserList()
+			if len(users) == 0 {
+				m.connErr = "No users configured for this host"
+				return m, nil
+			}
+			if len(users) == 1 {
+				return m.connectSSH(h, users[0])
+			}
+			return m.startUserSelect(h), nil
 		}
 	}
 	return m, nil
 }
 
-func (m model) connectSSH() (tea.Model, tea.Cmd) {
-	h := m.filtered[m.hostCursor]
+func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
+	m.phase = phaseDashboard
+	m.selectedHost = host.Host{}
 
 	var password []byte
 	if h.AuthType == "password" && len(h.EncPassword) > 0 {
@@ -121,13 +132,21 @@ func (m model) connectSSH() (tea.Model, tea.Cmd) {
 	sess := &sshclient.Session{
 		Host:     h.Hostname,
 		Port:     h.Port,
-		User:     h.User,
+		User:     user,
 		Password: password,
 	}
 
 	return m, tea.Exec(sess, func(err error) tea.Msg {
 		return sshDoneMsg{err: err}
 	})
+}
+
+func (m model) startUserSelect(h host.Host) model {
+	m.phase = phaseUserSelect
+	m.selectedHost = h
+	m.userCursor = 0
+	m.connErr = ""
+	return m
 }
 
 // ------------------------------------------------------------------
@@ -277,7 +296,7 @@ func (m model) renderDetails() string {
 	lines := []string{
 		render("Alias", h.Alias),
 		render("Host", h.Hostname),
-		render("User", h.User),
+		render("Users", strings.Join(h.UserList(), ", ")),
 		render("Port", fmt.Sprintf("%d", h.Port)),
 		render("Auth", authLabel),
 	}
@@ -299,6 +318,62 @@ func (m model) renderCommands() string {
 
 	col := 16
 	return "  " + pad(cmd("a", "add"), col) + cmd("e", "edit") + "\n" +
-		"  " + pad(cmd("d", "delete"), col) + cmd("⏎", "connect") + "\n" +
+		"  " + pad(cmd("d", "delete"), col) + cmd("⏎", "connect/user") + "\n" +
 		"  " + pad(cmd("/", "search"), col) + cmd("q", "quit")
+}
+
+func (m model) updateUserSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+
+	users := m.selectedHost.UserList()
+	if len(users) == 0 {
+		m.phase = phaseDashboard
+		return m, nil
+	}
+
+	switch key.String() {
+	case "esc":
+		m.phase = phaseDashboard
+		return m, nil
+	case "j", "down":
+		if m.userCursor < len(users)-1 {
+			m.userCursor++
+		}
+	case "k", "up":
+		if m.userCursor > 0 {
+			m.userCursor--
+		}
+	case "enter":
+		return m.connectSSH(m.selectedHost, users[m.userCursor])
+	}
+
+	return m, nil
+}
+
+func (m model) viewUserSelect() string {
+	users := m.selectedHost.UserList()
+
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Choose SSH User") + "\n")
+	b.WriteString(subtitleStyle.Render(m.selectedHost.Alias+" • "+m.selectedHost.Hostname) + "\n\n")
+
+	for i, user := range users {
+		prefix := "  "
+		style := lipgloss.NewStyle().Foreground(text)
+		if i == m.userCursor {
+			prefix = "▸ "
+			style = lipgloss.NewStyle().Foreground(highlight).Bold(true)
+		}
+		b.WriteString(style.Render(prefix + user))
+		if i < len(users)-1 {
+			b.WriteByte('\n')
+		}
+	}
+
+	b.WriteString("\n\n")
+	b.WriteString(statusBarStyle.Render("↑↓ navigate • enter connect • esc back"))
+	return boxStyle.Render(b.String())
 }

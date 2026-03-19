@@ -50,8 +50,8 @@ func newHostFormInputs(alias, hostname, user string, port int) []textinput.Model
 	inputs[1].Width = 36
 
 	inputs[2] = textinput.New()
-	inputs[2].Placeholder = "e.g. root"
-	inputs[2].CharLimit = 64
+	inputs[2].Placeholder = "e.g. root, ubuntu, deploy"
+	inputs[2].CharLimit = 256
 	inputs[2].Width = 36
 
 	inputs[3] = textinput.New()
@@ -83,14 +83,14 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 	m.formErr = ""
 	m.formAuthType = "key"
 
-	var alias, hostname, user string
+	var alias, hostname, users string
 	var port int
 	if editID != "" {
 		for _, h := range m.store.Hosts {
 			if h.ID == editID {
 				alias = h.Alias
 				hostname = h.Hostname
-				user = h.User
+				users = strings.Join(h.UserList(), ", ")
 				port = h.Port
 				if h.AuthType != "" {
 					m.formAuthType = h.AuthType
@@ -100,7 +100,7 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 		}
 	}
 
-	m.formInputs = newHostFormInputs(alias, hostname, user, port)
+	m.formInputs = newHostFormInputs(alias, hostname, users, port)
 	return m, textinput.Blink
 }
 
@@ -172,7 +172,7 @@ func (m model) cycleFormFocus(dir int) (tea.Model, tea.Cmd) {
 func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 	alias := strings.TrimSpace(m.formInputs[0].Value())
 	hostname := strings.TrimSpace(m.formInputs[1].Value())
-	user := strings.TrimSpace(m.formInputs[2].Value())
+	users := parseUsers(m.formInputs[2].Value())
 	portStr := strings.TrimSpace(m.formInputs[3].Value())
 	pwd := m.formInputs[4].Value()
 
@@ -184,8 +184,8 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 		m.formErr = "Hostname is required"
 		return m, nil
 	}
-	if user == "" {
-		m.formErr = "User is required"
+	if len(users) == 0 {
+		m.formErr = "At least one user is required"
 		return m, nil
 	}
 
@@ -202,7 +202,7 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 	h := host.Host{
 		Alias:    alias,
 		Hostname: hostname,
-		User:     user,
+		Users:    users,
 		Port:     port,
 		AuthType: m.formAuthType,
 	}
@@ -268,7 +268,7 @@ func (m model) viewHostForm() string {
 
 	renderField(fAlias, "Alias", 0)
 	renderField(fHostname, "Hostname", 1)
-	renderField(fUser, "User", 2)
+	renderField(fUser, "Users", 2)
 	renderField(fPort, "Port", 3)
 
 	// Auth type toggle
@@ -312,4 +312,22 @@ func (m model) viewHostForm() string {
 
 	b.WriteString(statusBarStyle.Render("tab/↑↓ navigate • space toggle auth • enter save • esc cancel"))
 	return boxStyle.Render(b.String())
+}
+
+func parseUsers(raw string) []string {
+	parts := strings.Split(raw, ",")
+	users := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		user := strings.TrimSpace(part)
+		if user == "" {
+			continue
+		}
+		if _, ok := seen[user]; ok {
+			continue
+		}
+		seen[user] = struct{}{}
+		users = append(users, user)
+	}
+	return users
 }

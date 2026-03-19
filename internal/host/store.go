@@ -11,13 +11,14 @@ import (
 )
 
 type Host struct {
-	ID          string `json:"id"`
-	Alias       string `json:"alias"`
-	Hostname    string `json:"hostname"`
-	User        string `json:"user"`
-	Port        int    `json:"port"`
-	AuthType    string `json:"auth_type"`
-	EncPassword []byte `json:"enc_password,omitempty"`
+	ID          string   `json:"id"`
+	Alias       string   `json:"alias"`
+	Hostname    string   `json:"hostname"`
+	User        string   `json:"user,omitempty"`
+	Users       []string `json:"users,omitempty"`
+	Port        int      `json:"port"`
+	AuthType    string   `json:"auth_type"`
+	EncPassword []byte   `json:"enc_password,omitempty"`
 }
 
 type Store struct {
@@ -46,6 +47,9 @@ func NewStore(dir string) (*Store, error) {
 	}
 	if err := json.Unmarshal(data, s); err != nil {
 		return nil, err
+	}
+	for i := range s.Hosts {
+		s.Hosts[i].Normalize()
 	}
 	return s, nil
 }
@@ -77,6 +81,7 @@ func (s *Store) Add(h Host) error {
 	if h.Port == 0 {
 		h.Port = 22
 	}
+	h.Normalize()
 	s.Hosts = append(s.Hosts, h)
 	return s.Save()
 }
@@ -85,6 +90,7 @@ func (s *Store) Update(id string, h Host) error {
 	for i, existing := range s.Hosts {
 		if existing.ID == id {
 			h.ID = id
+			h.Normalize()
 			s.Hosts[i] = h
 			return s.Save()
 		}
@@ -111,11 +117,49 @@ func (s *Store) Filter(query string) []Host {
 	q := strings.ToLower(query)
 	var out []Host
 	for _, h := range s.Hosts {
+		users := strings.ToLower(strings.Join(h.UserList(), " "))
 		if strings.Contains(strings.ToLower(h.Alias), q) ||
 			strings.Contains(strings.ToLower(h.Hostname), q) ||
-			strings.Contains(strings.ToLower(h.User), q) {
+			strings.Contains(users, q) {
 			out = append(out, h)
 		}
+	}
+	return out
+}
+
+func (h Host) UserList() []string {
+	users := normalizeUsers(h.Users)
+	if len(users) > 0 {
+		return users
+	}
+	if h.User == "" {
+		return nil
+	}
+	return normalizeUsers([]string{h.User})
+}
+
+func (h *Host) Normalize() {
+	h.Users = h.UserList()
+	if len(h.Users) > 0 {
+		h.User = h.Users[0]
+		return
+	}
+	h.User = ""
+}
+
+func normalizeUsers(users []string) []string {
+	seen := make(map[string]struct{}, len(users))
+	var out []string
+	for _, user := range users {
+		user = strings.TrimSpace(user)
+		if user == "" {
+			continue
+		}
+		if _, ok := seen[user]; ok {
+			continue
+		}
+		seen[user] = struct{}{}
+		out = append(out, user)
 	}
 	return out
 }
