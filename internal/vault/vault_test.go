@@ -178,11 +178,15 @@ func TestLockoutAfterMaxAttempts(t *testing.T) {
 		t.Fatal(err)
 	}
 	SetProfile("lockout-test")
-	resetFailures()
+	if err := resetFailures(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Record max failures.
 	for i := 0; i < maxFailedAttempts; i++ {
-		recordFailure()
+		if err := recordFailure(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	err := checkLockout()
@@ -191,7 +195,9 @@ func TestLockoutAfterMaxAttempts(t *testing.T) {
 	}
 
 	// Reset for other tests.
-	resetFailures()
+	if err := resetFailures(); err != nil {
+		t.Fatal(err)
+	}
 	err = checkLockout()
 	if err != nil {
 		t.Fatal("expected no error after reset")

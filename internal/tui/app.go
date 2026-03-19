@@ -11,7 +11,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/managedssh/managedssh/internal/audit"
+	"github.com/managedssh/managedssh/internal/health"
 	"github.com/managedssh/managedssh/internal/host"
+	"github.com/managedssh/managedssh/internal/rbac"
 	"github.com/managedssh/managedssh/internal/vault"
 )
 
@@ -58,6 +60,9 @@ type model struct {
 	// Audit log
 	auditLog *audit.Log
 
+	// RBAC
+	rbacConfig *rbac.Config
+
 	// Profile selection
 	profiles      []string
 	profileCursor int
@@ -73,6 +78,9 @@ type model struct {
 	connErr       string
 	userCursor    int
 	selectedHost  host.Host
+
+	// Health check results
+	healthResults []health.Result
 
 	// Host form
 	formInputs   []textinput.Model
@@ -185,8 +193,13 @@ func (m model) initDashboard() (model, error) {
 	if err != nil {
 		return m, err
 	}
+	rbacCfg, err := rbac.Load(dir)
+	if err != nil {
+		return m, err
+	}
 	m.store = store
 	m.auditLog = auditLog
+	m.rbacConfig = rbacCfg
 	m.search = newSearchInput()
 	m.searchFocused = false
 	m.hostCursor = 0

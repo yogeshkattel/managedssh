@@ -13,6 +13,12 @@ A terminal UI application for managing and connecting to SSH hosts, built in Go.
 - **Encrypted password storage** — Passwords are encrypted before touching disk and only decrypted in memory at connection time
 - **SSH key and password auth** — Supports SSH agent, local key files (`id_ed25519`, `id_rsa`, `id_ecdsa`), password, and keyboard-interactive authentication
 - **Connection tuning** — Per-host connection timeout from 1 to 300 seconds
+- **RBAC controls** — Profile-scoped `admin`, `operator`, and `viewer` roles for TUI and CLI actions
+- **Health monitoring** — Run TCP reachability checks across hosts from the dashboard or CLI
+- **SSH key management** — Generate and inspect local SSH keys from the CLI
+- **Compliance export** — Export audit history as JSON or CSV reports
+- **Session recording** — Record terminal session traffic to per-session log files
+- **Analytics** — Summarize connection success rates, hot hosts, users, and recent failures
 - **Audit log** — Appends connection and host-management events to a local JSONL log
 - **Full PTY sessions** — Connects with `xterm-256color`, forwards terminal resize signals
 
@@ -49,6 +55,14 @@ managedssh
 managedssh [--profile <name>]
 managedssh profiles
 managedssh version
+managedssh role get
+managedssh role set [admin|operator|viewer]
+managedssh health
+managedssh audit export --format json --output report.json
+managedssh audit stats
+managedssh keys list
+managedssh keys generate managedssh_prod --comment "ops@example.com"
+managedssh sessions
 ```
 
 | Command | Purpose |
@@ -57,6 +71,14 @@ managedssh version
 | `managedssh --profile work` | Start directly in a specific profile |
 | `managedssh profiles` | List available local profiles |
 | `managedssh version` | Print the app version |
+| `managedssh role get` | Show the current profile role |
+| `managedssh role set ...` | Change the current profile role |
+| `managedssh health` | Run host reachability checks for the current profile |
+| `managedssh audit export ...` | Export audit history for compliance/reporting |
+| `managedssh audit stats` | Show analytics summary from audit history |
+| `managedssh keys list` | List local SSH key pairs in `~/.ssh/` |
+| `managedssh keys generate ...` | Generate a new Ed25519 SSH key pair |
+| `managedssh sessions` | List recorded SSH session logs |
 
 ### First run
 
@@ -112,10 +134,11 @@ After unlocking, you land on the main dashboard:
 │                             │ │   Port       22             │
 │                             │ │   Auth       SSH Key        │
 ╰─────────────────────────────╯ ├ Commands ───────────────────┤
+                                │   / search      h health    │
+                                │   s stats       l lock      │
                                 │   a add         e edit      │
                                 │   d delete      ⏎ connect   │
-                                │   / search      c change key│
-                                │   l lock        q quit      │
+                                │   c change key  q quit      │
                                 ╰─────────────────────────────╯
 ```
 
@@ -140,8 +163,10 @@ Search matches:
 | `/` | Focus search — live-filters as you type |
 | `Esc` | Clear search filter |
 | `c` | Change the master key |
+| `h` | Run health checks for visible hosts |
 | `l` | Lock the current session immediately |
 | `q` | Quit |
+| `s` | Show connection analytics summary |
 
 When a host has multiple users, ManagedSSH opens a user picker before connecting.
 
@@ -197,6 +222,37 @@ Password handling:
 - `c` rotates the master key and re-encrypts stored host passwords
 - Interrupted master-key rotation is recovered automatically on next start
 
+### Enterprise controls
+
+Roles:
+
+- `admin`: full access, including export, keys, sessions, and role management
+- `operator`: connect, view hosts, run health checks, view analytics, and lock
+- `viewer`: browse hosts only
+
+Enterprise CLI workflows:
+
+- `managedssh health` checks all hosts in the selected profile
+- `managedssh audit export --format json|csv --output file` writes audit exports with `0600` file permissions
+- `managedssh audit stats` shows connection analytics
+- `managedssh keys generate <name>` creates a new Ed25519 key pair under `~/.ssh/`
+- `managedssh sessions` lists recorded session logs for the profile
+
+RBAC enforcement:
+
+- `role set` requires an `admin` profile role
+- `health` requires a role that can run health checks
+- `audit export` requires `admin`
+- `audit stats` requires a role that can view analytics
+- `keys` requires `admin`
+- `sessions` requires `admin`
+
+Session recording:
+
+- SSH sessions are recorded under the profile `sessions/` directory
+- Recordings include live terminal traffic plus session start/end metadata
+- Filenames are sanitized to stay inside the profile recording directory
+
 ### SSH connection behavior
 
 When connecting, auth methods are tried in this order:
@@ -219,8 +275,20 @@ managedssh/
 │   │   └── vault.go                Master key, key derivation, encryption
 │   ├── audit/
 │   │   └── audit.go                JSONL audit logging
+│   ├── analytics/
+│   │   └── analytics.go            Connection summaries and trends
+│   ├── compliance/
+│   │   └── compliance.go           Audit/compliance export helpers
+│   ├── health/
+│   │   └── health.go               Concurrent TCP health checks
 │   ├── host/
 │   │   └── store.go                Host model, JSON persistence, CRUD
+│   ├── keymgr/
+│   │   └── keymgr.go               Local SSH key generation and listing
+│   ├── rbac/
+│   │   └── rbac.go                 Profile-scoped role enforcement
+│   ├── session/
+│   │   └── recorder.go             Session recording and listing
 │   ├── sshclient/
 │   │   └── client.go               SSH connection, PTY, auth methods
 │   └── tui/
@@ -238,9 +306,15 @@ managedssh/
 |---------|---------------|
 | `vault` | Master key lifecycle. Derives a 256-bit key from the password via **Argon2id** (128 MB memory, 4 threads). Encrypts/decrypts arbitrary data with **AES-256-GCM**. Stores only a salt and encrypted verifier token — never the password. |
 | `audit` | Appends structured JSON-lines audit events for connections and host-management actions. |
+| `analytics` | Builds connection summaries such as success rates, most-used hosts, and recent failures. |
+| `compliance` | Formats audit events as JSON and CSV compliance reports. |
+| `health` | Performs concurrent TCP reachability checks for stored hosts. |
 | `host` | `Host` struct and `Store` for CRUD operations. Persists hosts as JSON at `~/.config/managedssh/hosts.json`. Passwords are stored as encrypted byte blobs (opaque to the store). |
+| `keymgr` | Lists and generates local Ed25519 SSH key pairs with safe filename validation. |
+| `rbac` | Persists profile role policy and checks permissions for TUI/CLI actions. |
+| `session` | Records and lists SSH session logs for audit/compliance workflows. |
 | `sshclient` | Implements Bubble Tea's `ExecCommand` interface for seamless terminal handoff. Negotiates auth, requests a PTY, starts a shell, and forwards `SIGWINCH` for terminal resize. |
-| `tui` | All UI logic. A single Bubble Tea `model` with phase-based routing (`profile select → setup/unlock → dashboard → hostform/user select/change key`). Each phase has its own `update` and `view` methods split across files. |
+| `tui` | All UI logic. A single Bubble Tea `model` with phase-based routing (`profile select → setup/unlock → dashboard → hostform/user select/change key`) plus RBAC-aware health and analytics actions. |
 
 ### Security model
 
@@ -276,8 +350,10 @@ For the default profile, files are written directly there. Named profiles are st
 | `vault.json` | Argon2 salt, AES-GCM nonce, encrypted verifier | Salt is public; verifier is encrypted |
 | `hosts.json` | Host entries (alias, hostname, user, port, auth type, encrypted password blob) | Passwords are encrypted; metadata is plaintext |
 | `audit.jsonl` | JSON-lines audit events for host changes and SSH connections | Operational metadata |
+| `rbac.json` | Persisted role policy for the profile | Operational metadata |
 | `rotation.json` | Temporary rollback file used during master-key rotation | Contains previous vault/host state until rotation finishes |
 | `lockout.json` | Temporary failed-attempt counter for a locked profile | Operational metadata |
+| `sessions/` | Recorded SSH terminal sessions for the profile | Contains session traffic and metadata |
 
 ### Tech stack
 

@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -9,17 +11,32 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/managedssh/managedssh/internal/analytics"
 	"github.com/managedssh/managedssh/internal/audit"
+	"github.com/managedssh/managedssh/internal/health"
 	"github.com/managedssh/managedssh/internal/host"
+	"github.com/managedssh/managedssh/internal/rbac"
+	"github.com/managedssh/managedssh/internal/session"
 	"github.com/managedssh/managedssh/internal/sshclient"
 	"github.com/managedssh/managedssh/internal/vault"
 )
+
+// healthDoneMsg carries health check results back to the model.
+type healthDoneMsg struct {
+	results []health.Result
+}
 
 // ------------------------------------------------------------------
 // Update
 // ------------------------------------------------------------------
 
 func (m model) updateDashboard(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case healthDoneMsg:
+		m.healthResults = msg.results
+		m.connErr = fmt.Sprintf("Health check complete: %d hosts checked", len(msg.results))
+		return m, nil
+	}
 	if m.searchFocused {
 		return m.updateDashboardSearch(msg)
 	}
@@ -59,6 +76,20 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirmDelete = false
 	}
 
+	can := func(p rbac.Permission) bool {
+		if m.rbacConfig == nil {
+			return true
+		}
+		return m.rbacConfig.Can(p)
+	}
+	deny := func(action string) {
+		role := rbac.RoleAdmin
+		if m.rbacConfig != nil {
+			role = m.rbacConfig.Role
+		}
+		m.connErr = fmt.Sprintf("Permission denied: %s role cannot %s", role, action)
+	}
+
 	switch key.String() {
 	case "q":
 		vault.ZeroKey(m.encKey)
@@ -82,15 +113,27 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m = m.refreshFiltered()
 		}
 	case "a":
+		if !can(rbac.PermAddHost) {
+			deny("add hosts")
+			return m, nil
+		}
 		m, cmd := m.startHostForm("")
 		return m, cmd
 	case "e":
+		if !can(rbac.PermEditHost) {
+			deny("edit hosts")
+			return m, nil
+		}
 		if len(m.filtered) > 0 {
 			h := m.filtered[m.hostCursor]
 			m, cmd := m.startHostForm(h.ID)
 			return m, cmd
 		}
 	case "d":
+		if !can(rbac.PermDeleteHost) {
+			deny("delete hosts")
+			return m, nil
+		}
 		if len(m.filtered) > 0 {
 			if m.confirmDelete {
 				h := m.filtered[m.hostCursor]
@@ -111,20 +154,59 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "c":
-		// Change master key.
+		if !can(rbac.PermChangeKey) {
+			deny("change master key")
+			return m, nil
+		}
 		m = m.startChangeKey()
 		return m, textinput.Blink
 	case "l":
-		// Manual lock.
 		vault.ZeroKey(m.encKey)
 		m.encKey = nil
 		m.store = nil
 		m.filtered = nil
+		m.rbacConfig = nil
 		m.phase = phaseUnlock
 		m.input = newPasswordInput("Locked — enter master key...")
 		m.err = ""
 		return m, textinput.Blink
+	case "h":
+		if !can(rbac.PermHealthCheck) {
+			deny("run health checks")
+			return m, nil
+		}
+		// Health check all visible hosts.
+		hosts := make([]health.Host, len(m.filtered))
+		for i, fh := range m.filtered {
+			hosts[i] = health.Host{ID: fh.ID, Hostname: fh.Hostname, Port: fh.Port}
+		}
+		m.connErr = "Running health checks..."
+		return m, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			results := health.CheckAll(ctx, hosts, 5*time.Second, 10)
+			return healthDoneMsg{results: results}
+		}
+	case "s":
+		if !can(rbac.PermViewAnalytics) {
+			deny("view analytics")
+			return m, nil
+		}
+		// Show analytics summary.
+		if m.auditLog != nil {
+			events, err := m.auditLog.Recent(0)
+			if err == nil {
+				stats := analytics.Compute(events)
+				m.connErr = fmt.Sprintf("Stats: %d connections, %.0f%% success, %d hosts, %d users",
+					stats.TotalConnections, stats.SuccessRate, stats.UniqueHosts, stats.UniqueUsers)
+			}
+		}
+		return m, nil
 	case "enter":
+		if !can(rbac.PermConnect) {
+			deny("connect")
+			return m, nil
+		}
 		if len(m.filtered) > 0 {
 			h := m.filtered[m.hostCursor]
 			users := h.UserList()
@@ -170,7 +252,6 @@ func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 		password = dec
 	}
 
-	// Record connection start time for audit.
 	connStart := time.Now()
 
 	sess := &sshclient.Session{
@@ -181,6 +262,16 @@ func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 		Timeout:  h.ConnTimeoutDuration(),
 	}
 
+	// Set up session recording if vault dir is available.
+	var recorder *session.Recorder
+	if dir, err := vault.Dir(); err == nil {
+		sessDir := filepath.Join(dir, "sessions")
+		if rec, err := session.NewRecorder(sessDir, h.Alias, user); err == nil {
+			recorder = rec
+			sess.Capture = rec
+		}
+	}
+
 	hostAlias := h.Alias
 	hostname := h.Hostname
 	port := h.Port
@@ -189,6 +280,9 @@ func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 	store := m.store
 
 	return m, tea.Exec(sess, func(err error) tea.Msg {
+		if recorder != nil {
+			recorder.Close()
+		}
 		ev := audit.Event{
 			Type:      "ssh_connection",
 			HostAlias: hostAlias,
@@ -235,7 +329,7 @@ func (m model) viewDashboard() string {
 		panelH = 10
 	}
 
-	// Title with profile indicator.
+	// Title with profile + role indicator.
 	profile := vault.ActiveProfile()
 	if profile == "" {
 		profile = "default"
@@ -243,6 +337,9 @@ func (m model) viewDashboard() string {
 	titleText := "⚡ ManagedSSH"
 	if profile != "default" {
 		titleText += " [" + profile + "]"
+	}
+	if m.rbacConfig != nil && m.rbacConfig.Role != rbac.RoleAdmin {
+		titleText += " (" + string(m.rbacConfig.Role) + ")"
 	}
 	title := titleStyle.Render(titleText)
 
@@ -289,9 +386,10 @@ func (m model) viewDashboard() string {
 	view := title + "\n" + searchLine + "\n\n" + panels
 
 	if m.connErr != "" {
-		// Show as success (green) if it's a positive message.
-		if strings.Contains(m.connErr, "successfully") {
+		if strings.Contains(m.connErr, "successfully") || strings.Contains(m.connErr, "Stats:") || strings.Contains(m.connErr, "complete") {
 			view += "\n" + successStyle.Render(" ✓ "+m.connErr)
+		} else if strings.Contains(m.connErr, "Permission denied") {
+			view += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#FBBF24")).Bold(true).Render(" ⚠ "+m.connErr)
 		} else {
 			view += "\n" + errorStyle.Render(" ✗ "+m.connErr)
 		}
@@ -306,9 +404,11 @@ func (m model) viewDashboard() string {
 
 func (m model) renderHostList(maxW, maxH int) string {
 	if len(m.filtered) == 0 {
-		empty := "No hosts yet.\n\nPress " +
-			cmdKeyStyle.Render("a") + " to add your first host."
-		return lipgloss.NewStyle().Foreground(subtle).Render(empty)
+		msg := "No hosts yet."
+		if m.rbacConfig != nil && m.rbacConfig.Can(rbac.PermAddHost) {
+			msg += "\n\nPress " + cmdKeyStyle.Render("a") + " to add your first host."
+		}
+		return lipgloss.NewStyle().Foreground(subtle).Render(msg)
 	}
 
 	visible := maxH
@@ -345,14 +445,30 @@ func (m model) renderHostList(maxW, maxH int) string {
 			alias = alias[:aliasW-2] + "…"
 		}
 
-		// Show group tag if present.
+		// Health indicator.
+		healthIcon := ""
+		for _, r := range m.healthResults {
+			if r.HostID == h.ID {
+				if r.Alive {
+					healthIcon = lipgloss.NewStyle().Foreground(success).Render("●")
+				} else {
+					healthIcon = lipgloss.NewStyle().Foreground(danger).Render("●")
+				}
+				break
+			}
+		}
+
 		groupTag := ""
 		if h.Group != "" {
 			groupTag = lipgloss.NewStyle().Foreground(subtle).Render(" [" + h.Group + "]")
 		}
 
 		line := fmt.Sprintf("%s%-*s %s", cursor, aliasW, alias, h.Hostname)
-		b.WriteString(style.Render(line) + groupTag)
+		rendered := style.Render(line) + groupTag
+		if healthIcon != "" {
+			rendered = healthIcon + " " + rendered
+		}
+		b.WriteString(rendered)
 		if i < end-1 {
 			b.WriteByte('\n')
 		}
@@ -399,6 +515,20 @@ func (m model) renderDetails() string {
 	if h.LastConnectedAt != "" {
 		lines = append(lines, render("Last", h.LastConnectedAt))
 	}
+
+	// Health result for this host.
+	for _, r := range m.healthResults {
+		if r.HostID == h.ID {
+			status := lipgloss.NewStyle().Foreground(success).Render("Reachable")
+			if !r.Alive {
+				status = lipgloss.NewStyle().Foreground(danger).Render("Unreachable")
+			}
+			latency := fmt.Sprintf(" (%s)", r.Latency.Round(time.Millisecond))
+			lines = append(lines, render("Health", status+latency))
+			break
+		}
+	}
+
 	return strings.Join(lines, "\n")
 }
 
@@ -414,12 +544,52 @@ func (m model) renderCommands() string {
 	pad := func(s string, w int) string {
 		return lipgloss.NewStyle().Width(w).Render(s)
 	}
+	can := func(p rbac.Permission) bool {
+		return m.rbacConfig == nil || m.rbacConfig.Can(p)
+	}
 
 	col := 18
-	return "  " + pad(cmd("a", "add"), col) + cmd("e", "edit") + "\n" +
-		"  " + pad(cmd("d", "delete"), col) + cmd("⏎", "connect") + "\n" +
-		"  " + pad(cmd("/", "search"), col) + cmd("c", "change key") + "\n" +
-		"  " + pad(cmd("l", "lock"), col) + cmd("q", "quit")
+	lines := "  " + pad(cmd("/", "search"), col)
+	if can(rbac.PermHealthCheck) {
+		lines += cmd("h", "health")
+	}
+	lines += "\n"
+	lines += "  "
+	if can(rbac.PermViewAnalytics) {
+		lines += pad(cmd("s", "stats"), col)
+	} else {
+		lines += pad("", col)
+	}
+	lines += cmd("l", "lock") + "\n"
+
+	if can(rbac.PermAddHost) {
+		lines += "  " + pad(cmd("a", "add"), col)
+	} else {
+		lines += "  " + pad("", col)
+	}
+	if can(rbac.PermEditHost) {
+		lines += cmd("e", "edit") + "\n"
+	} else {
+		lines += "\n"
+	}
+	if can(rbac.PermDeleteHost) {
+		lines += "  " + pad(cmd("d", "delete"), col)
+	} else {
+		lines += "  " + pad("", col)
+	}
+	if can(rbac.PermConnect) {
+		lines += cmd("⏎", "connect") + "\n"
+	} else {
+		lines += "\n"
+	}
+	if can(rbac.PermChangeKey) {
+		lines += "  " + pad(cmd("c", "change key"), col)
+	} else {
+		lines += "  " + pad("", col)
+	}
+	lines += cmd("q", "quit")
+
+	return lines
 }
 
 func (m model) updateUserSelect(msg tea.Msg) (tea.Model, tea.Cmd) {

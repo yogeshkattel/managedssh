@@ -25,15 +25,14 @@ type Session struct {
 	User     string
 	Password []byte
 	Timeout  time.Duration // 0 = default 10s
+	Capture  io.Writer
 
 	stdin  io.Reader
 	stdout io.Writer
 	stderr io.Writer
 }
 
-func (s *Session) SetStdin(r io.Reader)  { s.stdin = r }
-func (s *Session) SetStdout(w io.Writer) { s.stdout = w }
-func (s *Session) SetStderr(w io.Writer) { s.stderr = w }
+func (s *Session) SetStdin(r io.Reader) { s.stdin = r }
 
 func (s *Session) Run() error {
 	defer s.zeroPassword()
@@ -125,7 +124,11 @@ func (s *Session) Run() error {
 		return fmt.Errorf("PTY request failed: %w", err)
 	}
 
-	session.Stdin = s.stdin
+	stdin := s.stdin
+	if s.Capture != nil && stdin != nil {
+		stdin = io.TeeReader(stdin, s.Capture)
+	}
+	session.Stdin = stdin
 	session.Stdout = s.stdout
 	session.Stderr = s.stderr
 
@@ -219,4 +222,20 @@ func loadKeyFiles() []ssh.Signer {
 		signers = append(signers, signer)
 	}
 	return signers
+}
+
+func (s *Session) SetStdout(w io.Writer) {
+	if s.Capture != nil && w != nil {
+		s.stdout = io.MultiWriter(w, s.Capture)
+		return
+	}
+	s.stdout = w
+}
+
+func (s *Session) SetStderr(w io.Writer) {
+	if s.Capture != nil && w != nil {
+		s.stderr = io.MultiWriter(w, s.Capture)
+		return
+	}
+	s.stderr = w
 }

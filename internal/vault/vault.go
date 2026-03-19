@@ -88,25 +88,25 @@ func checkLockout() error {
 	return nil
 }
 
-func recordFailure() {
+func recordFailure() error {
 	lockoutMu.Lock()
 	defer lockoutMu.Unlock()
 
 	state, err := readLockoutState()
 	if err != nil {
-		return
+		return err
 	}
 	state.Failures++
 	if state.Failures >= maxFailedAttempts && state.LockedAt.IsZero() {
 		state.LockedAt = time.Now()
 	}
-	_ = writeLockoutState(state)
+	return writeLockoutState(state)
 }
 
-func resetFailures() {
+func resetFailures() error {
 	lockoutMu.Lock()
 	defer lockoutMu.Unlock()
-	_ = clearLockoutState()
+	return clearLockoutState()
 }
 
 // ------------------------------------------------------------------
@@ -428,14 +428,20 @@ func Unlock(password string) ([]byte, error) {
 	key := deriveKey([]byte(password), m.Salt)
 	plain, err := decryptBytes(key, m.Nonce, m.Verifier, aadVaultVerifier)
 	if err != nil {
-		recordFailure()
+		if recErr := recordFailure(); recErr != nil {
+			return nil, fmt.Errorf("%w: failed to persist lockout state: %v", ErrWrongPassword, recErr)
+		}
 		return nil, ErrWrongPassword
 	}
 	if string(plain) != verifierPlaintext {
-		recordFailure()
+		if recErr := recordFailure(); recErr != nil {
+			return nil, fmt.Errorf("%w: failed to persist lockout state: %v", ErrWrongPassword, recErr)
+		}
 		return nil, ErrWrongPassword
 	}
-	resetFailures()
+	if err := resetFailures(); err != nil {
+		return nil, fmt.Errorf("failed to reset lockout state: %w", err)
+	}
 	return key, nil
 }
 
