@@ -24,6 +24,7 @@ type Session struct {
 	Port     int
 	User     string
 	Password []byte
+	Timeout  time.Duration // 0 = default 10s
 
 	stdin  io.Reader
 	stdout io.Writer
@@ -45,8 +46,10 @@ func (s *Session) Run() error {
 		authMethods = append(authMethods, ssh.KeyboardInteractive(
 			func(_, _ string, questions []string, echos []bool) ([]string, error) {
 				answers := make([]string, len(questions))
-				if len(questions) == 1 && !echos[0] {
-					answers[0] = pw
+				for i := range questions {
+					if i < len(echos) && !echos[i] {
+						answers[i] = pw
+					}
 				}
 				return answers, nil
 			},
@@ -71,11 +74,16 @@ func (s *Session) Run() error {
 		return fmt.Errorf("known_hosts setup failed: %w", err)
 	}
 
+	timeout := s.Timeout
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+
 	config := &ssh.ClientConfig{
 		User:            s.User,
 		Auth:            authMethods,
 		HostKeyCallback: hostKeyCallback,
-		Timeout:         10 * time.Second,
+		Timeout:         timeout,
 	}
 
 	addr := net.JoinHostPort(s.Host, strconv.Itoa(s.Port))

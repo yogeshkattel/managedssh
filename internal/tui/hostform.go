@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/managedssh/managedssh/internal/audit"
 	"github.com/managedssh/managedssh/internal/host"
 	"github.com/managedssh/managedssh/internal/vault"
 )
@@ -19,24 +20,28 @@ const (
 	fHostname = 1
 	fUser     = 2
 	fPort     = 3
-	fAuth     = 4 // not a textinput — toggle handled separately
-	fPassword = 5 // maps to formInputs[4]
+	fGroup    = 4
+	fTags     = 5
+	fTimeout  = 6
+	fAuth     = 7 // not a textinput — toggle handled separately
+	fPassword = 8 // maps to formInputs[7]
 )
 
 // formInputIdx returns the textinput slice index for a given focus
 // position, or -1 for the auth toggle which has no textinput.
 func formInputIdx(focus int) int {
-	if focus >= 0 && focus <= 3 {
+	switch {
+	case focus >= 0 && focus <= 6:
 		return focus
+	case focus == fPassword:
+		return 7
+	default:
+		return -1
 	}
-	if focus == fPassword {
-		return 4
-	}
-	return -1
 }
 
-func newHostFormInputs(alias, hostname, user string, port int) []textinput.Model {
-	inputs := make([]textinput.Model, 5)
+func newHostFormInputs(alias, hostname, user string, port int, group, tags string, timeout int) []textinput.Model {
+	inputs := make([]textinput.Model, 8)
 
 	inputs[0] = textinput.New()
 	inputs[0].Placeholder = "e.g. prod-web"
@@ -60,17 +65,37 @@ func newHostFormInputs(alias, hostname, user string, port int) []textinput.Model
 	inputs[3].Width = 10
 
 	inputs[4] = textinput.New()
-	inputs[4].Placeholder = "Enter password (optional)"
-	inputs[4].EchoMode = textinput.EchoPassword
-	inputs[4].EchoCharacter = '•'
-	inputs[4].CharLimit = 128
+	inputs[4].Placeholder = "e.g. production, staging"
+	inputs[4].CharLimit = 64
 	inputs[4].Width = 36
+
+	inputs[5] = textinput.New()
+	inputs[5].Placeholder = "e.g. web, database, critical"
+	inputs[5].CharLimit = 256
+	inputs[5].Width = 36
+
+	inputs[6] = textinput.New()
+	inputs[6].Placeholder = "10 (seconds, default)"
+	inputs[6].CharLimit = 5
+	inputs[6].Width = 10
+
+	inputs[7] = textinput.New()
+	inputs[7].Placeholder = "Enter password (optional)"
+	inputs[7].EchoMode = textinput.EchoPassword
+	inputs[7].EchoCharacter = '•'
+	inputs[7].CharLimit = 128
+	inputs[7].Width = 36
 
 	inputs[0].SetValue(alias)
 	inputs[1].SetValue(hostname)
 	inputs[2].SetValue(user)
 	if port > 0 {
 		inputs[3].SetValue(fmt.Sprintf("%d", port))
+	}
+	inputs[4].SetValue(group)
+	inputs[5].SetValue(tags)
+	if timeout > 0 {
+		inputs[6].SetValue(fmt.Sprintf("%d", timeout))
 	}
 
 	return inputs
@@ -83,8 +108,8 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 	m.formErr = ""
 	m.formAuthType = "key"
 
-	var alias, hostname, users string
-	var port int
+	var alias, hostname, users, group, tags string
+	var port, timeout int
 	if editID != "" {
 		for _, h := range m.store.Hosts {
 			if h.ID == editID {
@@ -92,6 +117,9 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 				hostname = h.Hostname
 				users = strings.Join(h.UserList(), ", ")
 				port = h.Port
+				group = h.Group
+				tags = strings.Join(h.Tags, ", ")
+				timeout = h.ConnTimeout
 				if h.AuthType != "" {
 					m.formAuthType = h.AuthType
 				}
@@ -100,7 +128,7 @@ func (m model) startHostForm(editID string) (model, tea.Cmd) {
 		}
 	}
 
-	m.formInputs = newHostFormInputs(alias, hostname, users, port)
+	m.formInputs = newHostFormInputs(alias, hostname, users, port, group, tags, timeout)
 	return m, textinput.Blink
 }
 
@@ -174,7 +202,10 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 	hostname := strings.TrimSpace(m.formInputs[1].Value())
 	users := parseUsers(m.formInputs[2].Value())
 	portStr := strings.TrimSpace(m.formInputs[3].Value())
-	pwd := m.formInputs[4].Value()
+	group := strings.TrimSpace(m.formInputs[4].Value())
+	tagsRaw := m.formInputs[5].Value()
+	timeoutStr := strings.TrimSpace(m.formInputs[6].Value())
+	pwd := m.formInputs[7].Value()
 
 	if alias == "" {
 		m.formErr = "Alias is required"
@@ -199,12 +230,27 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 		port = p
 	}
 
+	var connTimeout int
+	if timeoutStr != "" {
+		t, err := strconv.Atoi(timeoutStr)
+		if err != nil || t < 1 || t > 300 {
+			m.formErr = "Timeout must be 1–300 seconds"
+			return m, nil
+		}
+		connTimeout = t
+	}
+
+	tags := parseTags(tagsRaw)
+
 	h := host.Host{
-		Alias:    alias,
-		Hostname: hostname,
-		Users:    users,
-		Port:     port,
-		AuthType: m.formAuthType,
+		Alias:       alias,
+		Hostname:    hostname,
+		Users:       users,
+		Port:        port,
+		AuthType:    m.formAuthType,
+		Group:       group,
+		Tags:        tags,
+		ConnTimeout: connTimeout,
 	}
 
 	if m.formAuthType == "password" {
@@ -225,7 +271,17 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 		}
 	}
 
+	action := "host_added"
 	if m.formEditing != "" {
+		action = "host_updated"
+		// Preserve created_at from existing host.
+		for _, existing := range m.store.Hosts {
+			if existing.ID == m.formEditing {
+				h.CreatedAt = existing.CreatedAt
+				h.LastConnectedAt = existing.LastConnectedAt
+				break
+			}
+		}
 		if err := m.store.Update(m.formEditing, h); err != nil {
 			m.formErr = "Failed to save: " + err.Error()
 			return m, nil
@@ -236,6 +292,13 @@ func (m model) submitHostForm() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+
+	m.logAudit(audit.Event{
+		Type:      action,
+		HostAlias: alias,
+		Hostname:  hostname,
+		Success:   true,
+	})
 
 	m.phase = phaseDashboard
 	m.formErr = ""
@@ -270,6 +333,9 @@ func (m model) viewHostForm() string {
 	renderField(fHostname, "Hostname", 1)
 	renderField(fUser, "Users", 2)
 	renderField(fPort, "Port", 3)
+	renderField(fGroup, "Group", 4)
+	renderField(fTags, "Tags", 5)
+	renderField(fTimeout, "Timeout (s)", 6)
 
 	// Auth type toggle
 	{
@@ -300,7 +366,7 @@ func (m model) viewHostForm() string {
 	}
 
 	if m.formAuthType == "password" {
-		renderField(fPassword, "Password", 4)
+		renderField(fPassword, "Password", 7)
 		if m.formEditing != "" {
 			b.WriteString(hintStyle.Render("  Leave empty to keep current password") + "\n\n")
 		}
@@ -330,4 +396,22 @@ func parseUsers(raw string) []string {
 		users = append(users, user)
 	}
 	return users
+}
+
+func parseTags(raw string) []string {
+	parts := strings.Split(raw, ",")
+	tags := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		tag := strings.TrimSpace(part)
+		if tag == "" {
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		tags = append(tags, tag)
+	}
+	return tags
 }

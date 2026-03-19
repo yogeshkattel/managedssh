@@ -5,10 +5,15 @@ A terminal UI application for managing and connecting to SSH hosts, built in Go.
 ## Features
 
 - **Interactive TUI** — Full-screen terminal interface with keyboard-driven navigation
+- **Multiple profiles** — Separate vaults and host lists per profile, selectable at launch or via `--profile`
 - **Master key protection** — All sensitive data is encrypted with a master password using Argon2id + AES-256-GCM
-- **Host management** — Add, edit, delete, and search SSH hosts
+- **Host management** — Add, edit, delete, group, tag, and search SSH hosts
+- **Multi-user hosts** — Store multiple SSH users per host and choose one at connect time
+- **Session controls** — Manual lock, automatic idle lock, and in-app master key rotation
 - **Encrypted password storage** — Passwords are encrypted before touching disk and only decrypted in memory at connection time
 - **SSH key and password auth** — Supports SSH agent, local key files (`id_ed25519`, `id_rsa`, `id_ecdsa`), password, and keyboard-interactive authentication
+- **Connection tuning** — Per-host connection timeout from 1 to 300 seconds
+- **Audit log** — Appends connection and host-management events to a local JSONL log
 - **Full PTY sessions** — Connects with `xterm-256color`, forwards terminal resize signals
 
 ## Installation
@@ -38,9 +43,59 @@ sudo mv managedssh /usr/local/bin/
 managedssh
 ```
 
+### CLI commands
+
+```bash
+managedssh [--profile <name>]
+managedssh profiles
+managedssh version
+```
+
+| Command | Purpose |
+|---------|---------|
+| `managedssh` | Start the TUI using auto-detected profile selection |
+| `managedssh --profile work` | Start directly in a specific profile |
+| `managedssh profiles` | List available local profiles |
+| `managedssh version` | Print the app version |
+
 ### First run
 
-On first launch you'll be prompted to create a **master key** (minimum 8 characters). This key derives a 256-bit encryption key that protects all stored passwords. You'll need to enter it every time you start the application.
+On first launch you'll be prompted to create a **master key**. This key derives a 256-bit encryption key that protects all stored passwords. You'll need to enter it every time you start the application.
+
+Master key requirements:
+
+- Minimum 8 characters
+- Must include at least one uppercase letter
+- Must include at least one lowercase letter
+- Must include at least one digit
+
+After five failed unlock attempts, the selected profile is temporarily locked for five minutes.
+
+### Profiles
+
+ManagedSSH supports isolated profiles. Each profile has its own:
+
+- `vault.json`
+- `hosts.json`
+- `audit.jsonl`
+
+Startup behavior:
+
+1. If no profile exists yet, the app starts first-time setup.
+2. If exactly one profile exists, it is selected automatically.
+3. If multiple profiles exist, the app shows a profile picker.
+
+Profile picker keys:
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move down |
+| `k` / `↑` | Move up |
+| `Enter` | Open selected profile |
+| `n` | Create a new profile |
+| `Ctrl+C` | Quit |
+
+Profile names must be simple labels, not paths. Values such as `../prod` or nested paths are rejected in both the TUI and `--profile`.
 
 ### Dashboard
 
@@ -59,11 +114,20 @@ After unlocking, you land on the main dashboard:
 ╰─────────────────────────────╯ ├ Commands ───────────────────┤
                                 │   a add         e edit      │
                                 │   d delete      ⏎ connect   │
-                                │   / search      q quit      │
+                                │   / search      c change key│
+                                │   l lock        q quit      │
                                 ╰─────────────────────────────╯
 ```
 
-### Keybindings
+Search matches:
+
+- Alias
+- Hostname
+- User list
+- Group
+- Tags
+
+### Dashboard keys
 
 | Key | Action |
 |-----|--------|
@@ -72,12 +136,37 @@ After unlocking, you land on the main dashboard:
 | `a` | Add new host |
 | `e` | Edit selected host |
 | `d` | Delete selected host (press twice to confirm) |
-| `Enter` | SSH into selected host |
-| `/` | Focus search — live-filters by alias, hostname, or user |
+| `Enter` | SSH into selected host, or choose a user first if the host has multiple users |
+| `/` | Focus search — live-filters as you type |
 | `Esc` | Clear search filter |
+| `c` | Change the master key |
+| `l` | Lock the current session immediately |
 | `q` | Quit |
 
+When a host has multiple users, ManagedSSH opens a user picker before connecting.
+
+User picker keys:
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move down |
+| `k` / `↑` | Move up |
+| `Enter` | Connect with selected user |
+| `Esc` | Return to dashboard |
+
 ### Host form
+
+Fields:
+
+- Alias
+- Hostname
+- Users, comma-separated
+- Port
+- Group
+- Tags, comma-separated
+- Timeout in seconds
+- Auth method: `SSH Key` or `Password`
+- Password, when password auth is selected
 
 | Key | Action |
 |-----|--------|
@@ -86,6 +175,37 @@ After unlocking, you land on the main dashboard:
 | `Space` | Toggle auth method (on Auth Method field) |
 | `Enter` | Save |
 | `Esc` | Cancel |
+
+Validation rules:
+
+- Alias is required
+- Hostname is required
+- At least one user is required
+- Port must be `1-65535`
+- Timeout must be `1-300` seconds when set
+
+Password handling:
+
+- Passwords are optional even when password auth is selected
+- Existing passwords are preserved during edit if the password field is left empty
+- Passwords are decrypted only in memory right before connection
+
+### Locking and key rotation
+
+- The session auto-locks after 5 minutes of inactivity
+- `l` locks the session immediately
+- `c` rotates the master key and re-encrypts stored host passwords
+- Interrupted master-key rotation is recovered automatically on next start
+
+### SSH connection behavior
+
+When connecting, auth methods are tried in this order:
+
+1. **Password** + **keyboard-interactive** (if the host has a stored password)
+2. **SSH agent** (`SSH_AUTH_SOCK`)
+3. **Key files** (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, `~/.ssh/id_ecdsa`)
+
+The SSH session runs with a full `xterm-256color` PTY. Terminal resize signals (`SIGWINCH`) are forwarded to the remote session in real time. Host keys are verified against `~/.ssh/known_hosts`.
 
 ## Architecture
 
@@ -97,6 +217,8 @@ managedssh/
 ├── internal/
 │   ├── vault/
 │   │   └── vault.go                Master key, key derivation, encryption
+│   ├── audit/
+│   │   └── audit.go                JSONL audit logging
 │   ├── host/
 │   │   └── store.go                Host model, JSON persistence, CRUD
 │   ├── sshclient/
@@ -114,10 +236,11 @@ managedssh/
 
 | Package | Responsibility |
 |---------|---------------|
-| `vault` | Master key lifecycle. Derives a 256-bit key from the password via **Argon2id** (64 MB memory, 4 threads). Encrypts/decrypts arbitrary data with **AES-256-GCM**. Stores only a salt and encrypted verifier token — never the password. |
+| `vault` | Master key lifecycle. Derives a 256-bit key from the password via **Argon2id** (128 MB memory, 4 threads). Encrypts/decrypts arbitrary data with **AES-256-GCM**. Stores only a salt and encrypted verifier token — never the password. |
+| `audit` | Appends structured JSON-lines audit events for connections and host-management actions. |
 | `host` | `Host` struct and `Store` for CRUD operations. Persists hosts as JSON at `~/.config/managedssh/hosts.json`. Passwords are stored as encrypted byte blobs (opaque to the store). |
 | `sshclient` | Implements Bubble Tea's `ExecCommand` interface for seamless terminal handoff. Negotiates auth, requests a PTY, starts a shell, and forwards `SIGWINCH` for terminal resize. |
-| `tui` | All UI logic. A single Bubble Tea `model` with phase-based routing (`setup → unlock → dashboard → hostform`). Each phase has its own `update` and `view` methods split across files. |
+| `tui` | All UI logic. A single Bubble Tea `model` with phase-based routing (`profile select → setup/unlock → dashboard → hostform/user select/change key`). Each phase has its own `update` and `view` methods split across files. |
 
 ### Security model
 
@@ -125,7 +248,7 @@ managedssh/
 Master password
       │
       ▼
- Argon2id (salt, 64MB, 4 threads)
+ Argon2id (salt, 128MB, 4 threads)
       │
       ▼
  256-bit derived key (held in memory only)
@@ -140,25 +263,21 @@ Master password
 - Each host password is independently encrypted with a unique random nonce. The nonce is prepended to the ciphertext.
 - The derived key exists **only in process memory** for the duration of the session.
 - All config files are written with `0600` permissions. The config directory uses `0700`.
-
-### SSH authentication
-
-When connecting, auth methods are tried in this order:
-
-1. **Password** + **keyboard-interactive** (if the host has a stored password)
-2. **SSH agent** (`SSH_AUTH_SOCK`)
-3. **Key files** (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, `~/.ssh/id_ecdsa`)
-
-The SSH session runs with a full `xterm-256color` PTY. Terminal resize signals (`SIGWINCH`) are forwarded to the remote session in real time.
+- Master-key rotation writes a recovery file first so an interrupted re-encryption can be rolled back safely on next launch.
 
 ### Data storage
 
-All data lives under `~/.config/managedssh/`:
+All data lives under `~/.config/managedssh/`.
+
+For the default profile, files are written directly there. Named profiles are stored under `~/.config/managedssh/<profile>/`.
 
 | File | Contents | Sensitive |
 |------|----------|-----------|
 | `vault.json` | Argon2 salt, AES-GCM nonce, encrypted verifier | Salt is public; verifier is encrypted |
 | `hosts.json` | Host entries (alias, hostname, user, port, auth type, encrypted password blob) | Passwords are encrypted; metadata is plaintext |
+| `audit.jsonl` | JSON-lines audit events for host changes and SSH connections | Operational metadata |
+| `rotation.json` | Temporary rollback file used during master-key rotation | Contains previous vault/host state until rotation finishes |
+| `lockout.json` | Temporary failed-attempt counter for a locked profile | Operational metadata |
 
 ### Tech stack
 

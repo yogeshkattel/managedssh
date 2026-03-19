@@ -3,11 +3,13 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/managedssh/managedssh/internal/audit"
 	"github.com/managedssh/managedssh/internal/host"
 	"github.com/managedssh/managedssh/internal/sshclient"
 	"github.com/managedssh/managedssh/internal/vault"
@@ -59,6 +61,7 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch key.String() {
 	case "q":
+		vault.ZeroKey(m.encKey)
 		m.quitting = true
 		return m, tea.Quit
 	case "j", "down":
@@ -93,6 +96,13 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h := m.filtered[m.hostCursor]
 				if err := m.store.Delete(h.ID); err != nil {
 					m.connErr = "Delete failed: " + err.Error()
+				} else {
+					m.logAudit(audit.Event{
+						Type:      "host_deleted",
+						HostAlias: h.Alias,
+						Hostname:  h.Hostname,
+						Success:   true,
+					})
 				}
 				m.confirmDelete = false
 				m = m.refreshFiltered()
@@ -100,6 +110,20 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmDelete = true
 			}
 		}
+	case "c":
+		// Change master key.
+		m = m.startChangeKey()
+		return m, textinput.Blink
+	case "l":
+		// Manual lock.
+		vault.ZeroKey(m.encKey)
+		m.encKey = nil
+		m.store = nil
+		m.filtered = nil
+		m.phase = phaseUnlock
+		m.input = newPasswordInput("Locked — enter master key...")
+		m.err = ""
+		return m, textinput.Blink
 	case "enter":
 		if len(m.filtered) > 0 {
 			h := m.filtered[m.hostCursor]
@@ -117,6 +141,12 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) logAudit(ev audit.Event) {
+	if m.auditLog != nil {
+		_ = m.auditLog.Record(ev)
+	}
+}
+
 func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 	m.phase = phaseDashboard
 	m.selectedHost = host.Host{}
@@ -124,19 +154,58 @@ func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 	var password []byte
 	if h.AuthType == "password" && len(h.EncPassword) > 0 {
 		dec, err := vault.Decrypt(m.encKey, h.EncPassword)
-		if err == nil {
-			password = dec
+		if err != nil {
+			m.connErr = "Stored password could not be decrypted"
+			m.logAudit(audit.Event{
+				Type:      "ssh_connection",
+				HostAlias: h.Alias,
+				Hostname:  h.Hostname,
+				User:      user,
+				Port:      h.Port,
+				Success:   false,
+				Error:     "stored password could not be decrypted",
+			})
+			return m, nil
 		}
+		password = dec
 	}
+
+	// Record connection start time for audit.
+	connStart := time.Now()
 
 	sess := &sshclient.Session{
 		Host:     h.Hostname,
 		Port:     h.Port,
 		User:     user,
 		Password: password,
+		Timeout:  h.ConnTimeoutDuration(),
 	}
 
+	hostAlias := h.Alias
+	hostname := h.Hostname
+	port := h.Port
+	hostID := h.ID
+	auditLog := m.auditLog
+	store := m.store
+
 	return m, tea.Exec(sess, func(err error) tea.Msg {
+		ev := audit.Event{
+			Type:      "ssh_connection",
+			HostAlias: hostAlias,
+			Hostname:  hostname,
+			User:      user,
+			Port:      port,
+			Success:   err == nil,
+			Duration:  time.Since(connStart).Round(time.Second).String(),
+		}
+		if err != nil {
+			ev.Error = err.Error()
+		} else if store != nil {
+			_ = store.TouchConnected(hostID)
+		}
+		if auditLog != nil {
+			_ = auditLog.Record(ev)
+		}
 		return sshDoneMsg{err: err}
 	})
 }
@@ -166,8 +235,16 @@ func (m model) viewDashboard() string {
 		panelH = 10
 	}
 
-	// Title
-	title := titleStyle.Render("⚡ ManagedSSH")
+	// Title with profile indicator.
+	profile := vault.ActiveProfile()
+	if profile == "" {
+		profile = "default"
+	}
+	titleText := "⚡ ManagedSSH"
+	if profile != "default" {
+		titleText += " [" + profile + "]"
+	}
+	title := titleStyle.Render(titleText)
 
 	// Search bar
 	searchIcon := lipgloss.NewStyle().Foreground(subtle).Render("🔍 ")
@@ -212,8 +289,12 @@ func (m model) viewDashboard() string {
 	view := title + "\n" + searchLine + "\n\n" + panels
 
 	if m.connErr != "" {
-		errBanner := errorStyle.Render(" ✗ " + m.connErr)
-		view += "\n" + errBanner
+		// Show as success (green) if it's a positive message.
+		if strings.Contains(m.connErr, "successfully") {
+			view += "\n" + successStyle.Render(" ✓ "+m.connErr)
+		} else {
+			view += "\n" + errorStyle.Render(" ✗ "+m.connErr)
+		}
 	}
 
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, view)
@@ -264,8 +345,14 @@ func (m model) renderHostList(maxW, maxH int) string {
 			alias = alias[:aliasW-2] + "…"
 		}
 
+		// Show group tag if present.
+		groupTag := ""
+		if h.Group != "" {
+			groupTag = lipgloss.NewStyle().Foreground(subtle).Render(" [" + h.Group + "]")
+		}
+
 		line := fmt.Sprintf("%s%-*s %s", cursor, aliasW, alias, h.Hostname)
-		b.WriteString(style.Render(line))
+		b.WriteString(style.Render(line) + groupTag)
 		if i < end-1 {
 			b.WriteByte('\n')
 		}
@@ -300,6 +387,18 @@ func (m model) renderDetails() string {
 		render("Port", fmt.Sprintf("%d", h.Port)),
 		render("Auth", authLabel),
 	}
+	if h.Group != "" {
+		lines = append(lines, render("Group", h.Group))
+	}
+	if len(h.Tags) > 0 {
+		lines = append(lines, render("Tags", strings.Join(h.Tags, ", ")))
+	}
+	if h.ConnTimeout > 0 {
+		lines = append(lines, render("Timeout", fmt.Sprintf("%ds", h.ConnTimeout)))
+	}
+	if h.LastConnectedAt != "" {
+		lines = append(lines, render("Last", h.LastConnectedAt))
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -316,10 +415,11 @@ func (m model) renderCommands() string {
 		return lipgloss.NewStyle().Width(w).Render(s)
 	}
 
-	col := 16
+	col := 18
 	return "  " + pad(cmd("a", "add"), col) + cmd("e", "edit") + "\n" +
-		"  " + pad(cmd("d", "delete"), col) + cmd("⏎", "connect/user") + "\n" +
-		"  " + pad(cmd("/", "search"), col) + cmd("q", "quit")
+		"  " + pad(cmd("d", "delete"), col) + cmd("⏎", "connect") + "\n" +
+		"  " + pad(cmd("/", "search"), col) + cmd("c", "change key") + "\n" +
+		"  " + pad(cmd("l", "lock"), col) + cmd("q", "quit")
 }
 
 func (m model) updateUserSelect(msg tea.Msg) (tea.Model, tea.Cmd) {

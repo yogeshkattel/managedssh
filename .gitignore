@@ -28,6 +28,10 @@ go.work.sum
 *.enc
 credentials.enc
 backup/
+.masterkey
+
+# Audit logs (contain connection history)
+audit.jsonl
 
 # OS
 .DS_Store
