@@ -285,7 +285,41 @@ func (m model) renderHostList(maxW, maxH int) string {
 		return lipgloss.NewStyle().Foreground(subtle).Render(empty)
 	}
 
-	visible := maxH
+	// Column widths — adapt to available space.
+	colAlias := 14
+	colHost := 18
+	colPort := 6
+	colUsers := 6
+	colAuth := 8
+	if maxW > 60 {
+		colAlias = 18
+		colHost = 22
+	}
+
+	// Header
+	headerStyle := lipgloss.NewStyle().Foreground(subtle).Bold(true)
+	header := fmt.Sprintf("  %-*s %-*s %-*s %-*s %-*s",
+		colAlias, "ALIAS",
+		colHost, "HOST",
+		colPort, "PORT",
+		colUsers, "USERS",
+		colAuth, "AUTH")
+
+	// Separator line stretching full width
+	separatorW := maxW - 2
+	if separatorW < 1 {
+		separatorW = 1
+	}
+	separator := lipgloss.NewStyle().Foreground(subtle).Render(strings.Repeat("─", separatorW))
+
+	var b strings.Builder
+	b.WriteString(headerStyle.Render(header))
+	b.WriteByte('\n')
+	b.WriteString(separator)
+	b.WriteByte('\n')
+
+	// Rows
+	visible := maxH - 3 // account for header + separator + possible scroll hint
 	if visible < 1 {
 		visible = 1
 	}
@@ -298,12 +332,6 @@ func (m model) renderHostList(maxW, maxH int) string {
 		end = len(m.filtered)
 	}
 
-	aliasW := 16
-	if maxW > 40 {
-		aliasW = 20
-	}
-
-	var b strings.Builder
 	for i := offset; i < end; i++ {
 		h := m.filtered[i]
 
@@ -314,12 +342,22 @@ func (m model) renderHostList(maxW, maxH int) string {
 			style = lipgloss.NewStyle().Foreground(highlight).Bold(true)
 		}
 
-		alias := h.Alias
-		if len(alias) > aliasW-1 {
-			alias = alias[:aliasW-2] + "…"
+		alias := truncate(h.Alias, colAlias)
+		hostname := truncate(h.Hostname, colHost)
+		port := fmt.Sprintf("%d", h.Port)
+		userCount := fmt.Sprintf("%d", len(h.AccountNames()))
+		auth := "key"
+		if h.DefaultAuthType == "password" {
+			auth = "pass"
 		}
 
-		line := fmt.Sprintf("%s%-*s %s", cursor, aliasW, alias, h.Hostname)
+		line := fmt.Sprintf("%s%-*s %-*s %-*s %-*s %-*s",
+			cursor,
+			colAlias, alias,
+			colHost, hostname,
+			colPort, port,
+			colUsers, userCount,
+			colAuth, auth)
 		b.WriteString(style.Render(line))
 		if i < end-1 {
 			b.WriteByte('\n')
@@ -331,6 +369,16 @@ func (m model) renderHostList(maxW, maxH int) string {
 	}
 
 	return b.String()
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 1 {
+		return "…"
+	}
+	return s[:maxLen-1] + "…"
 }
 
 func (m model) renderDetails() string {
