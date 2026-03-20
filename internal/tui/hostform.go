@@ -423,27 +423,44 @@ func (m model) viewHostForm() string {
 		title = "Edit Host"
 	}
 
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("📝 "+title) + "\n\n")
+	// Fixed form dimensions so the box never resizes.
+	formW := 90
+	formH := 36
+	colW := (formW - 6) / 2 // width per column
 
-	renderField := func(focus int, label string, idx int) {
+	// Helper: render a single field into a fixed-width column string.
+	renderFieldCol := func(focus int, label string, idx int, w int) string {
 		lbl := inputLabelStyle.Render(label)
 		if m.formFocus == focus {
 			lbl = focusedLabel("▸ " + label)
 		}
-		b.WriteString(lbl + "\n")
-		b.WriteString(m.formInputs[idx].View() + "\n\n")
+		field := m.formInputs[idx].View()
+		col := lipgloss.NewStyle().Width(w)
+		return col.Render(lbl + "\n" + field)
 	}
 
-	renderField(fAlias, "Alias", 0)
-	renderField(fHostname, "Hostname", 1)
-	renderField(fUsers, "Users", 2)
-	b.WriteString(hintStyle.Render("  Comma-separated usernames. Example: root, ubuntu, deploy") + "\n\n")
-	renderField(fPort, "Port", 3)
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("📝 "+title) + "\n\n")
 
+	// Row 1: Alias | Hostname
+	left := renderFieldCol(fAlias, "Alias", 0, colW)
+	right := renderFieldCol(fHostname, "Hostname", 1, colW)
+	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right) + "\n\n")
+
+	// Row 2: Users | Port
+	left = renderFieldCol(fUsers, "Users", 2, colW)
+	right = renderFieldCol(fPort, "Port", 3, colW)
+	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right) + "\n")
+	b.WriteString(hintStyle.Render("  Comma-separated usernames") + "\n\n")
+
+	// Separator
+	b.WriteString(lipgloss.NewStyle().Foreground(subtle).Render(strings.Repeat("─", formW-4)) + "\n\n")
+
+	// Full-width sections below
 	b.WriteString(m.renderDefaultAuthSection())
 
 	if len(m.formUserConfigs) > 0 {
+		b.WriteString(lipgloss.NewStyle().Foreground(subtle).Render(strings.Repeat("─", formW-4)) + "\n\n")
 		b.WriteString(m.renderSelectedUserSection())
 	}
 
@@ -452,7 +469,16 @@ func (m model) viewHostForm() string {
 	}
 
 	b.WriteString(statusBarStyle.Render("tab/↑↓ navigate • ←→ adjust selection • enter save • esc cancel"))
-	return boxStyle.Render(b.String())
+
+	// Pad content to fixed height so the box stays stable.
+	content := b.String()
+	lines := strings.Split(content, "\n")
+	for len(lines) < formH {
+		lines = append(lines, "")
+	}
+	content = strings.Join(lines[:formH], "\n")
+
+	return boxStyle.Width(formW).Render(content)
 }
 
 func (m model) renderDefaultAuthSection() string {
