@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
@@ -123,30 +122,6 @@ func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 	if !ok {
 		m.connErr = "Selected user is no longer available"
 		return m, nil
-	}
-
-	if resolved.AuthType == "key" && len(resolved.EncKeyPass) == 0 {
-		var keyData []byte
-		if len(resolved.EncKey) > 0 {
-			dec, err := vault.Decrypt(m.encKey, resolved.EncKey)
-			if err == nil {
-				keyData = dec
-			}
-		}
-		if err := sshclient.Verify(sshclient.VerifyConfig{
-			Host:    h.Hostname,
-			Port:    h.Port,
-			User:    user,
-			KeyPath: resolved.KeyPath,
-			KeyData: keyData,
-		}); err != nil {
-			zeroBytes(keyData)
-			var needPass *sshclient.KeyPassphraseRequiredError
-			if errors.As(err, &needPass) {
-				return m.startKeyPassphrasePrompt(h, user, resolved), nil
-			}
-		}
-		zeroBytes(keyData)
 	}
 
 	return m.connectSSHWithResolved(h, user, resolved, nil, false)

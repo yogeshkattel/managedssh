@@ -369,6 +369,29 @@ func parseConfiguredKey(keyData []byte, keyPassphrase []byte) (ssh.Signer, error
 	return nil, fmt.Errorf("configured SSH key is invalid: %w", err)
 }
 
+// NeedsPassphrase checks locally (no network) whether the given key
+// requires a passphrase to decrypt. Returns true when a passphrase is
+// needed but none was supplied.
+func NeedsPassphrase(keyPath string, keyData []byte) bool {
+	switch {
+	case len(keyData) > 0:
+		_, err := ssh.ParsePrivateKey(keyData)
+		var missing *ssh.PassphraseMissingError
+		return errors.As(err, &missing)
+	case keyPath != "":
+		keyPath = expandUserPath(keyPath)
+		data, err := os.ReadFile(keyPath)
+		if err != nil {
+			return false
+		}
+		_, err = ssh.ParsePrivateKey(data)
+		var missing *ssh.PassphraseMissingError
+		return errors.As(err, &missing)
+	default:
+		return false
+	}
+}
+
 func Verify(cfg VerifyConfig) error {
 	authMethods, err := buildAuthMethods(cfg.Password, cfg.KeyPath, cfg.KeyData, cfg.KeyPassphrase)
 	if err != nil {

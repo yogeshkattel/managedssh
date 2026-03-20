@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/managedssh/managedssh/internal/host"
 	"github.com/managedssh/managedssh/internal/sshclient"
@@ -201,6 +202,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sshDoneMsg:
 		m.connErr = ""
 		if msg.err != nil {
+			// Ignore normal exit-status errors (user typed "exit" / logout).
+			var exitErr *ssh.ExitError
+			if errors.As(msg.err, &exitErr) {
+				m.pendingKeyPassSave = false
+				zeroBytes(m.pendingKeyPassphrase)
+				m.pendingKeyPassphrase = nil
+				return m, nil
+			}
 			if m.phase == phaseDashboard && m.pendingKeyPassSave {
 				m.phase = phaseKeyPassphrasePrompt
 				m.connectPassphraseInput = newKeyPassphraseInput()
