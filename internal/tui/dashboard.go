@@ -61,6 +61,13 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case "q":
 		m.quitting = true
 		return m, tea.Quit
+	case "l":
+		vault.ZeroKey(m.encKey)
+		m.encKey = nil
+		m.phase = phaseUnlock
+		m.input.Reset()
+		m.input.Focus()
+		return m, textinput.Blink
 	case "j", "down":
 		if m.hostCursor < len(m.filtered)-1 {
 			m.hostCursor++
@@ -439,7 +446,8 @@ func (m model) renderCommands() string {
 	col := 16
 	return "  " + pad(cmd("a", "add"), col) + cmd("e", "edit") + "\n" +
 		"  " + pad(cmd("d", "delete"), col) + cmd("⏎", "connect/user") + "\n" +
-		"  " + pad(cmd("/", "search"), col) + cmd("q", "quit")
+		"  " + pad(cmd("/", "search"), col) + cmd("l", "lock") + "\n" +
+		"  " + pad(cmd("q", "quit"), col)
 }
 
 func (m model) updateUserSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
