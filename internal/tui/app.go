@@ -29,11 +29,11 @@ const (
 	phaseKeyPassphrasePrompt
 )
 
-// sshDoneMsg is sent after an SSH session completes (or fails).
 type sshDoneMsg struct{ err error }
 type hostVerifyDoneMsg struct{ err error }
 type hostTrustDoneMsg struct{ err error }
 type saveKeyPassDoneMsg struct{ err error }
+type dashboardTrustDoneMsg struct{ err error }
 
 type formUserConfig struct {
 	Username            string
@@ -48,10 +48,11 @@ type formUserConfig struct {
 }
 
 type model struct {
-	phase    phase
-	width    int
-	height   int
-	quitting bool
+	phase         phase
+	previousPhase phase
+	width         int
+	height        int
+	quitting      bool
 
 	encKey []byte
 
@@ -211,6 +212,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingKeyPassphrase = nil
 				return m, nil
 			}
+			var unknown *sshclient.UnknownHostError
+			if errors.As(msg.err, &unknown) {
+				m.previousPhase = m.phase
+				m.phase = phaseHostTrustConfirm
+				m.pendingTrust = unknown
+				return m, nil
+			}
 			if m.phase == phaseDashboard && m.pendingKeyPassSave {
 				m.phase = phaseKeyPassphrasePrompt
 				m.connectPassphraseInput = newKeyPassphraseInput()
@@ -237,6 +245,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		zeroBytes(m.pendingKeyPassphrase)
 		m.pendingKeyPassphrase = nil
 		return m, nil
+	case dashboardTrustDoneMsg:
+		if msg.err != nil {
+			m.phase = phaseDashboard
+			m.connErr = "Failed to trust host key: " + msg.err.Error()
+			return m, nil
+		}
+		return m.connectSSHWithResolved(m.connectHost, m.connectUser, m.connectResolved, m.pendingKeyPassphrase, m.pendingKeyPassSave)
 	}
 
 	switch m.phase {
@@ -452,13 +467,24 @@ func (m model) updateHostTrustConfirm(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch key.String() {
 	case "y", "enter":
-		m.phase = phaseHostVerifying
 		m.formErr = ""
+		if m.previousPhase == phaseDashboard {
+			return m, func() tea.Msg {
+				err := sshclient.TrustHostKey(m.pendingTrust)
+				return dashboardTrustDoneMsg{err: err}
+			}
+		}
+		m.phase = phaseHostVerifying
 		return m, trustAndVerifyHostCmd(m.pendingHost, m.encKey, m.pendingTrust)
 	case "n", "esc":
+		m.pendingTrust = nil
+		if m.previousPhase == phaseDashboard {
+			m.phase = phaseDashboard
+			m.connErr = "Host key was not trusted."
+			return m, nil
+		}
 		m.phase = phaseHostForm
 		m.formErr = "Host key was not trusted, so the host was not saved"
-		m.pendingTrust = nil
 		return m, nil
 	}
 

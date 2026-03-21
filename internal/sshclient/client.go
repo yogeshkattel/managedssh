@@ -78,7 +78,7 @@ func (s *Session) Run() error {
 	}
 	defer closeAuthResources(authMethods)
 
-	hostKeyCallback, err := buildHostKeyCallback()
+	hostKeyCallback, err := buildVerifyHostKeyCallback()
 	if err != nil {
 		return fmt.Errorf("known_hosts setup failed: %w", err)
 	}
