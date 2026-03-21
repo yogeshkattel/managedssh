@@ -124,6 +124,22 @@ func (m model) connectSSH(h host.Host, user string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// If key auth with no saved passphrase, check locally if one is needed.
+	if resolved.AuthType == "key" && len(resolved.EncKeyPass) == 0 {
+		var keyData []byte
+		if len(resolved.EncKey) > 0 {
+			dec, err := vault.Decrypt(m.encKey, resolved.EncKey)
+			if err == nil {
+				keyData = dec
+			}
+		}
+		needsPass := sshclient.NeedsPassphrase(resolved.KeyPath, keyData)
+		zeroBytes(keyData)
+		if needsPass {
+			return m.startKeyPassphrasePrompt(h, user, resolved), nil
+		}
+	}
+
 	return m.connectSSHWithResolved(h, user, resolved, nil, false)
 }
 

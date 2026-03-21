@@ -72,6 +72,7 @@ type model struct {
 	selectedHost  host.Host
 
 	// Host form
+	formTab                int // 0 = General, 1 = Users
 	formInputs             []textinput.Model
 	formFocus              int
 	formEditing            string

@@ -95,6 +95,7 @@ func newHostFormInputs(alias, hostname, users string, port int) []textinput.Mode
 func (m model) startHostForm(editID string) (model, tea.Cmd) {
 	m.phase = phaseHostForm
 	m.formEditing = editID
+	m.formTab = 0
 	m.formFocus = fAlias
 	m.formErr = ""
 	m.formDefaultAuth = "key"
@@ -163,14 +164,32 @@ func (m model) updateHostForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.phase = phaseDashboard
 			m = m.refreshFiltered()
 			return m, nil
+		case "ctrl+left":
+			return m.switchFormTab(0)
+		case "ctrl+right":
+			return m.switchFormTab(1)
 		case "tab":
 			if m.acceptPathSuggestion() {
 				return m, nil
 			}
+			// If at the last focus of this tab, switch to next tab
+			focuses := m.activeFormFocuses()
+			if len(focuses) > 0 && m.formFocus == focuses[len(focuses)-1] {
+				nextTab := (m.formTab + 1) % 2
+				return m.switchFormTab(nextTab)
+			}
 			return m.cycleFormFocus(1)
 		case "down":
 			return m.cycleFormFocus(1)
-		case "shift+tab", "up":
+		case "shift+tab":
+			// If at the first focus of this tab, switch to prev tab
+			focuses := m.activeFormFocuses()
+			if len(focuses) > 0 && m.formFocus == focuses[0] {
+				prevTab := (m.formTab + 1) % 2
+				return m.switchFormTab(prevTab)
+			}
+			return m.cycleFormFocus(-1)
+		case "up":
 			return m.cycleFormFocus(-1)
 		case "ctrl+n":
 			if m.cyclePathSuggestion(1) {
@@ -264,19 +283,42 @@ func (m model) cycleFormFocus(dir int) (tea.Model, tea.Cmd) {
 }
 
 func (m model) activeFormFocuses() []int {
-	focuses := []int{fAlias, fHostname, fUsers, fPort, fDefaultAuth}
-	if m.formDefaultAuth == "password" || m.formDefaultAuth == "key" {
-		focuses = append(focuses, fDefaultCredential)
-	}
-	if len(m.formUserConfigs) == 0 {
+	if m.formTab == 0 {
+		// General tab
+		focuses := []int{fAlias, fHostname, fPort, fDefaultAuth}
+		if m.formDefaultAuth == "password" || m.formDefaultAuth == "key" {
+			focuses = append(focuses, fDefaultCredential)
+		}
 		return focuses
 	}
-
-	focuses = append(focuses, fSelectedUser, fSelectedUserAuth)
-	if user := m.currentFormUser(); user != nil && !user.UseDefault && (user.AuthType == "password" || user.AuthType == "key") {
-		focuses = append(focuses, fSelectedUserCredential)
+	// Users tab
+	focuses := []int{fUsers}
+	if len(m.formUserConfigs) > 0 {
+		focuses = append(focuses, fSelectedUser, fSelectedUserAuth)
+		if user := m.currentFormUser(); user != nil && !user.UseDefault && (user.AuthType == "password" || user.AuthType == "key") {
+			focuses = append(focuses, fSelectedUserCredential)
+		}
 	}
 	return focuses
+}
+
+func (m model) switchFormTab(tab int) (tea.Model, tea.Cmd) {
+	if idx := formInputIdx(m.formFocus); idx >= 0 {
+		m.formInputs[idx].Blur()
+	}
+	m.formTab = tab
+	focuses := m.activeFormFocuses()
+	if len(focuses) > 0 {
+		m.formFocus = focuses[0]
+		if idx := formInputIdx(m.formFocus); idx >= 0 {
+			m.formInputs[idx].Focus()
+			m.refreshPathSuggestions()
+			return m, textinput.Blink
+		}
+	}
+	m.formPathSuggestions = nil
+	m.formPathSuggestIndex = 0
+	return m, nil
 }
 
 func (m model) submitHostForm() (tea.Model, tea.Cmd) {
@@ -428,47 +470,65 @@ func (m model) viewHostForm() string {
 	formH := 36
 	colW := (formW - 6) / 2 // width per column
 
-	// Helper: render a single field into a fixed-width column string.
-	renderFieldCol := func(focus int, label string, idx int, w int) string {
-		lbl := inputLabelStyle.Render(label)
-		if m.formFocus == focus {
-			lbl = focusedLabel("▸ " + label)
-		}
-		field := m.formInputs[idx].View()
-		col := lipgloss.NewStyle().Width(w)
-		return col.Render(lbl + "\n" + field)
-	}
-
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("📝 "+title) + "\n\n")
 
-	// Row 1: Alias | Hostname
-	left := renderFieldCol(fAlias, "Alias", 0, colW)
-	right := renderFieldCol(fHostname, "Hostname", 1, colW)
-	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right) + "\n\n")
+	// Tab bar
+	b.WriteString(m.renderFormTabs(formW-4) + "\n\n")
 
-	// Row 2: Users | Port
-	left = renderFieldCol(fUsers, "Users", 2, colW)
-	right = renderFieldCol(fPort, "Port", 3, colW)
-	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right) + "\n")
-	b.WriteString(hintStyle.Render("  Comma-separated usernames") + "\n\n")
+	if m.formTab == 0 {
+		// ── General tab ──
+		renderFieldCol := func(focus int, label string, idx int, w int) string {
+			lbl := inputLabelStyle.Render(label)
+			if m.formFocus == focus {
+				lbl = focusedLabel("▸ " + label)
+			}
+			field := m.formInputs[idx].View()
+			col := lipgloss.NewStyle().Width(w)
+			return col.Render(lbl + "\n" + field)
+		}
 
-	// Separator
-	b.WriteString(lipgloss.NewStyle().Foreground(subtle).Render(strings.Repeat("─", formW-4)) + "\n\n")
+		// Row 1: Alias | Hostname
+		left := renderFieldCol(fAlias, "Alias", 0, colW)
+		right := renderFieldCol(fHostname, "Hostname", 1, colW)
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right) + "\n\n")
 
-	// Full-width sections below
-	b.WriteString(m.renderDefaultAuthSection())
+		// Row 2: Port | Default Auth
+		portCol := renderFieldCol(fPort, "Port", 3, colW)
+		authCol := m.renderDefaultAuthChoiceCol(colW)
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, portCol, "  ", authCol) + "\n\n")
 
-	if len(m.formUserConfigs) > 0 {
+		// Separator
 		b.WriteString(lipgloss.NewStyle().Foreground(subtle).Render(strings.Repeat("─", formW-4)) + "\n\n")
-		b.WriteString(m.renderSelectedUserSection())
+
+		// Default credential (full width)
+		b.WriteString(m.renderDefaultCredentialSection())
+	} else {
+		// ── Users tab ──
+		// Users input (full width)
+		lbl := inputLabelStyle.Render("Users")
+		if m.formFocus == fUsers {
+			lbl = focusedLabel("▸ Users")
+		}
+		b.WriteString(lbl + "\n")
+		b.WriteString(m.formInputs[2].View() + "\n")
+		b.WriteString(hintStyle.Render("  Comma-separated usernames. Example: root, ubuntu, deploy") + "\n\n")
+
+		if len(m.formUserConfigs) > 0 {
+			// Separator
+			b.WriteString(lipgloss.NewStyle().Foreground(subtle).Render(strings.Repeat("─", formW-4)) + "\n\n")
+			b.WriteString(m.renderSelectedUserSection())
+		} else {
+			b.WriteString("\n")
+			b.WriteString(hintStyle.Render("  Type usernames above to configure per-user auth settings.") + "\n")
+		}
 	}
 
 	if m.formErr != "" {
 		b.WriteString(errorStyle.Render("✗ "+m.formErr) + "\n\n")
 	}
 
-	b.WriteString(statusBarStyle.Render("tab/↑↓ navigate • ←→ adjust selection • enter save • esc cancel"))
+	b.WriteString(statusBarStyle.Render("ctrl+←/→ switch tab • tab/↑↓ navigate • ←→ adjust • enter save • esc cancel"))
 
 	// Pad content to fixed height so the box stays stable.
 	content := b.String()
@@ -481,19 +541,55 @@ func (m model) viewHostForm() string {
 	return boxStyle.Width(formW).Render(content)
 }
 
-func (m model) renderDefaultAuthSection() string {
-	var b strings.Builder
+func (m model) renderFormTabs(w int) string {
+	generalLabel := " ⚙ General "
+	usersLabel := " 👤 Users "
+
+	activeTab := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#111827")).
+		Background(accent).
+		Bold(true).
+		Padding(0, 1)
+
+	inactiveTab := lipgloss.NewStyle().
+		Foreground(subtle).
+		Padding(0, 1)
+
+	var general, users string
+	if m.formTab == 0 {
+		general = activeTab.Render(generalLabel)
+		users = inactiveTab.Render(usersLabel)
+	} else {
+		general = inactiveTab.Render(generalLabel)
+		users = activeTab.Render(usersLabel)
+	}
+
+	userCount := ""
+	if n := len(m.formUserConfigs); n > 0 {
+		userCount = lipgloss.NewStyle().Foreground(subtle).Render(fmt.Sprintf(" (%d)", n))
+	}
+
+	tabs := general + "  " + users + userCount
+	line := lipgloss.NewStyle().Foreground(subtle).Render(strings.Repeat("─", w))
+	return tabs + "\n" + line
+}
+
+func (m model) renderDefaultAuthChoiceCol(w int) string {
 	lbl := inputLabelStyle.Render("Default Auth")
 	if m.formFocus == fDefaultAuth {
 		lbl = focusedLabel("▸ Default Auth")
 	}
-	b.WriteString(lbl + "\n")
-	b.WriteString("  " + authChoice("SSH Key", m.formDefaultAuth == "key") + "    " +
-		authChoice("Password", m.formDefaultAuth == "password"))
+	choices := authChoice("SSH Key", m.formDefaultAuth == "key") + "  " +
+		authChoice("Password", m.formDefaultAuth == "password")
 	if m.formFocus == fDefaultAuth {
-		b.WriteString(hintStyle.Render("  (left/right to change)"))
+		choices += hintStyle.Render(" ←→")
 	}
-	b.WriteString("\n\n")
+	col := lipgloss.NewStyle().Width(w)
+	return col.Render(lbl + "\n" + choices)
+}
+
+func (m model) renderDefaultCredentialSection() string {
+	var b strings.Builder
 
 	if m.formDefaultAuth == "password" {
 		fieldLabel := "Default Password"
@@ -515,7 +611,7 @@ func (m model) renderDefaultAuthSection() string {
 		}
 		b.WriteString(renderLabel + "\n")
 		b.WriteString(m.formInputs[4].View() + "\n")
-		b.WriteString(hintStyle.Render("  Enter a key path or paste private key text. Use \\n for new lines if needed.") + "\n")
+		b.WriteString(hintStyle.Render("  Key path or paste private key. Use \\n for new lines.") + "\n")
 		b.WriteString(m.renderPathSuggestions())
 		if m.formEditing != "" && hasDefaultKey(m) {
 			b.WriteString(hintStyle.Render("  Leave empty to keep the current default SSH key") + "\n")
@@ -526,6 +622,11 @@ func (m model) renderDefaultAuthSection() string {
 	return b.String()
 }
 
+// renderDefaultAuthSection is kept for backward compat but delegates to the new functions.
+func (m model) renderDefaultAuthSection() string {
+	return m.renderDefaultCredentialSection()
+}
+
 func (m model) renderSelectedUserSection() string {
 	user := m.currentFormUser()
 	if user == nil {
@@ -533,58 +634,72 @@ func (m model) renderSelectedUserSection() string {
 	}
 
 	var b strings.Builder
-	lbl := inputLabelStyle.Render("Selected User")
-	if m.formFocus == fSelectedUser {
-		lbl = focusedLabel("▸ Selected User")
-	}
-	b.WriteString(lbl + "\n")
-	b.WriteString("  " + m.renderUserTabs())
-	if m.formFocus == fSelectedUser {
-		b.WriteString(hintStyle.Render("  (left/right to switch)"))
-	}
-	b.WriteString("\n\n")
 
-	modeLabel := inputLabelStyle.Render("User Auth")
-	if m.formFocus == fSelectedUserAuth {
-		modeLabel = focusedLabel("▸ User Auth")
+	// ── User selector (horizontal tabs) ──
+	lbl := inputLabelStyle.Render("Select User")
+	if m.formFocus == fSelectedUser {
+		lbl = focusedLabel("▸ Select User")
 	}
-	b.WriteString(modeLabel + "\n")
-	b.WriteString("  " + authChoice("Use Host Default", user.UseDefault) + "    " +
-		authChoice("Password Override", !user.UseDefault && user.AuthType == "password") + "    " +
-		authChoice("SSH Key Override", !user.UseDefault && user.AuthType == "key"))
-	if m.formFocus == fSelectedUserAuth {
-		b.WriteString(hintStyle.Render("  (left/right to change)"))
+	b.WriteString(lbl + "\n\n")
+	b.WriteString("  " + m.renderUserTabs() + "\n")
+	if m.formFocus == fSelectedUser {
+		b.WriteString(hintStyle.Render("  ←/→ to switch users") + "\n")
 	}
 	b.WriteString("\n")
-	b.WriteString(hintStyle.Render("  Default means this user uses the host's main auth settings.") + "\n\n")
 
-	if !user.UseDefault && user.AuthType == "password" {
-		fieldLabel := "Override Password"
-		renderLabel := inputLabelStyle.Render(fieldLabel)
-		if m.formFocus == fSelectedUserCredential {
-			renderLabel = focusedLabel("▸ " + fieldLabel)
-		}
-		b.WriteString(renderLabel + "\n")
-		b.WriteString(m.formInputs[5].View() + "\n")
-		if m.formEditing != "" && len(user.ExistingEncPassword) > 0 {
-			b.WriteString(hintStyle.Render("  Leave empty to keep the current password for this user") + "\n")
-		}
-		b.WriteString("\n")
-	} else if !user.UseDefault && user.AuthType == "key" {
-		fieldLabel := "Override SSH Key"
-		renderLabel := inputLabelStyle.Render(fieldLabel)
-		if m.formFocus == fSelectedUserCredential {
-			renderLabel = focusedLabel("▸ " + fieldLabel)
-		}
-		b.WriteString(renderLabel + "\n")
-		b.WriteString(m.formInputs[5].View() + "\n")
-		b.WriteString(hintStyle.Render("  Enter a key path or paste private key text. Use \\n for new lines if needed.") + "\n")
-		b.WriteString(m.renderPathSuggestions())
-		if m.formEditing != "" && (user.ExistingKeyPath != "" || len(user.ExistingEncKey) > 0) {
-			b.WriteString(hintStyle.Render("  Leave empty to keep the current SSH key for this user") + "\n")
-		}
-		b.WriteString("\n")
+	// ── User card ──
+	cardBorder := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(highlight).
+		Padding(1, 2).
+		Width(80)
+
+	var card strings.Builder
+	card.WriteString(lipgloss.NewStyle().Foreground(highlight).Bold(true).Render("👤 "+user.Username) + "\n\n")
+
+	// Auth mode
+	authLabel := inputLabelStyle.Render("Auth Mode")
+	if m.formFocus == fSelectedUserAuth {
+		authLabel = focusedLabel("▸ Auth Mode")
 	}
+	card.WriteString(authLabel + "\n\n")
+	card.WriteString("  " + authChoice("Host Default", user.UseDefault) + "\n")
+	card.WriteString("  " + authChoice("Password", !user.UseDefault && user.AuthType == "password") + "\n")
+	card.WriteString("  " + authChoice("SSH Key", !user.UseDefault && user.AuthType == "key") + "\n")
+	if m.formFocus == fSelectedUserAuth {
+		card.WriteString(hintStyle.Render("  ←/→ to change") + "\n")
+	}
+
+	// Status summary or credential field
+	if user.UseDefault {
+		card.WriteString("\n" + hintStyle.Render("  This user inherits the host's default auth settings.") + "\n")
+	} else if user.AuthType == "password" {
+		card.WriteString("\n")
+		credLabel := inputLabelStyle.Render("Password")
+		if m.formFocus == fSelectedUserCredential {
+			credLabel = focusedLabel("▸ Password")
+		}
+		card.WriteString(credLabel + "\n")
+		card.WriteString(m.formInputs[5].View() + "\n")
+		if m.formEditing != "" && len(user.ExistingEncPassword) > 0 {
+			card.WriteString(hintStyle.Render("  Leave empty to keep current password") + "\n")
+		}
+	} else if user.AuthType == "key" {
+		card.WriteString("\n")
+		credLabel := inputLabelStyle.Render("SSH Key")
+		if m.formFocus == fSelectedUserCredential {
+			credLabel = focusedLabel("▸ SSH Key")
+		}
+		card.WriteString(credLabel + "\n")
+		card.WriteString(m.formInputs[5].View() + "\n")
+		card.WriteString(hintStyle.Render("  Key path or paste private key") + "\n")
+		card.WriteString(m.renderPathSuggestions())
+		if m.formEditing != "" && (user.ExistingKeyPath != "" || len(user.ExistingEncKey) > 0) {
+			card.WriteString(hintStyle.Render("  Leave empty to keep current SSH key") + "\n")
+		}
+	}
+
+	b.WriteString(cardBorder.Render(card.String()) + "\n")
 
 	return b.String()
 }
