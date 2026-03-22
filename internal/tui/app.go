@@ -27,6 +27,9 @@ const (
 	phaseHostVerifying
 	phaseHostTrustConfirm
 	phaseKeyPassphrasePrompt
+	phaseChangeKeyInit
+	phaseChangeKeyNew
+	phaseChangeKeyConfirm
 )
 
 type sshDoneMsg struct{ err error }
@@ -37,7 +40,6 @@ type dashboardTrustDoneMsg struct{ err error }
 
 type formUserConfig struct {
 	Username            string
-	UseDefault          bool
 	AuthType            string
 	Password            string
 	ExistingEncPassword []byte
@@ -73,18 +75,11 @@ type model struct {
 	selectedHost  host.Host
 
 	// Host form
-	formTab                int // 0 = General, 1 = Users
 	formInputs             []textinput.Model
 	formFocus              int
 	formEditing            string
 	formErr                string
-	formDefaultAuth        string
-	formDefaultPassword    string
-	formDefaultEncPassword []byte
-	formDefaultKeyValue    string
-	formDefaultKeyPath     string
-	formDefaultEncKey      []byte
-	formDefaultEncKeyPass  []byte
+	formDefaultUser        string
 	formUserConfigs        []formUserConfig
 	formUserCursor         int
 	formPathSuggestions    []string
@@ -223,7 +218,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.phase = phaseKeyPassphrasePrompt
 				m.connectPassphraseInput = newKeyPassphraseInput()
 			}
-			m.connErr = msg.err.Error()
+			m.connErr = formatAuthErr(msg.err)
 			m.pendingKeyPassSave = false
 			zeroBytes(m.pendingKeyPassphrase)
 			m.pendingKeyPassphrase = nil
@@ -273,6 +268,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateHostTrustConfirm(msg)
 	case phaseKeyPassphrasePrompt:
 		return m.updateKeyPassphrasePrompt(msg)
+	case phaseChangeKeyInit:
+		return m.updateChangeKeyInit(msg)
+	case phaseChangeKeyNew:
+		return m.updateChangeKeyNew(msg)
+	case phaseChangeKeyConfirm:
+		return m.updateChangeKeyConfirm(msg)
 	}
 	return m, nil
 }
@@ -302,6 +303,12 @@ func (m model) View() string {
 		content = m.viewHostTrustConfirm()
 	case phaseKeyPassphrasePrompt:
 		content = m.viewKeyPassphrasePrompt()
+	case phaseChangeKeyInit:
+		content = m.viewChangeKeyInit()
+	case phaseChangeKeyNew:
+		content = m.viewChangeKeyNew()
+	case phaseChangeKeyConfirm:
+		content = m.viewChangeKeyConfirm()
 	}
 
 	if m.width > 0 {
@@ -500,7 +507,7 @@ func (m model) handleHostVerifyDone(msg hostVerifyDoneMsg) (tea.Model, tea.Cmd) 
 			return m, nil
 		}
 		m.phase = phaseHostForm
-		m.formErr = msg.err.Error()
+		m.formErr = formatAuthErr(msg.err)
 		return m, nil
 	}
 
@@ -716,4 +723,15 @@ func Start() error {
 		vault.ZeroKey(fm.encKey)
 	}
 	return err
+}
+
+func formatAuthErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if strings.Contains(s, "unable to authenticate") || strings.Contains(s, "sign failed") || strings.Contains(s, "agent:") {
+		s += "\n  Tip: If you suspect a stale SSH/GPG agent conflict, run `ssh-add -D` and `gpgconf --kill gpg-agent`."
+	}
+	return s
 }

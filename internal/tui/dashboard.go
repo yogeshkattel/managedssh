@@ -68,6 +68,11 @@ func (m model) updateDashboardNormal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.Reset()
 		m.input.Focus()
 		return m, textinput.Blink
+	case "c":
+		m.phase = phaseChangeKeyInit
+		m.input = newPasswordInput("Current master key...")
+		m.err = ""
+		return m, textinput.Blink
 	case "j", "down":
 		if m.hostCursor < len(m.filtered)-1 {
 			m.hostCursor++
@@ -223,6 +228,14 @@ func (m model) startUserSelect(h host.Host) model {
 	m.phase = phaseUserSelect
 	m.selectedHost = h
 	m.userCursor = 0
+	if h.DefaultUser != "" {
+		for i, u := range h.AccountNames() {
+			if u == h.DefaultUser {
+				m.userCursor = i
+				break
+			}
+		}
+	}
 	m.connErr = ""
 	return m
 }
@@ -232,13 +245,16 @@ func (m model) startUserSelect(h host.Host) model {
 // ------------------------------------------------------------------
 
 func (m model) viewDashboard() string {
-	w := max(m.width, 80)
-	h := max(m.height, 24)
+	w := m.width
+	if w < 40 {
+		w = 40
+	}
+	h := m.height
+	if h < 15 {
+		h = 15
+	}
 
 	contentW := w - 4
-	leftW := contentW * 55 / 100
-	rightW := contentW - leftW - 1
-
 	panelH := h - 7
 	if panelH < 10 {
 		panelH = 10
@@ -258,34 +274,63 @@ func (m model) viewDashboard() string {
 		searchLine += lipgloss.NewStyle().Foreground(subtle).Render(count)
 	}
 
-	// Left panel — host list
-	listTextW := leftW - 4
-	listTextH := panelH - 4
-	hostContent := m.renderHostList(listTextW, listTextH)
+	var leftW, rightW, leftH, detailH, cmdH int
+	var panels string
 
-	leftPanel := panelBorder.
-		Width(leftW).
-		Height(panelH).
-		Render(panelTitleStyle.Render(" Hosts") + "\n\n" + hostContent)
+	if w < 75 {
+		// Stack panels vertically on narrow screens
+		leftW = contentW
+		rightW = contentW
 
-	// Right panels — details + commands
-	detailH := panelH*2/3 - 1
-	cmdH := panelH - detailH - 1
+		leftH = panelH * 45 / 100
+		detailH = panelH * 35 / 100
+		cmdH = panelH - leftH - detailH
 
-	detailContent := m.renderDetails()
-	detailPanel := panelBorder.
-		Width(rightW).
-		Height(detailH).
-		Render(panelTitleStyle.Render(" Server Details") + "\n\n" + detailContent)
+		if leftH < 5 {
+			leftH = 5
+		}
+		if detailH < 5 {
+			detailH = 5
+		}
+		if cmdH < 5 {
+			cmdH = 5
+		}
 
-	cmdContent := m.renderCommands()
-	cmdPanel := panelBorder.
-		Width(rightW).
-		Height(cmdH).
-		Render(panelTitleStyle.Render(" Commands") + "\n\n" + cmdContent)
+		hostContent := m.renderHostList(leftW-4, leftH-4)
+		leftPanel := panelBorder.Width(leftW).Height(leftH).Render(panelTitleStyle.Render(" Hosts") + "\n\n" + hostContent)
 
-	rightPanel := lipgloss.JoinVertical(lipgloss.Left, detailPanel, cmdPanel)
-	panels := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
+		detailContent := m.renderDetails()
+		detailPanel := panelBorder.Width(rightW).Height(detailH).Render(panelTitleStyle.Render(" Server Details") + "\n\n" + detailContent)
+
+		cmdContent := m.renderCommands(rightW - 4)
+		cmdPanel := panelBorder.Width(rightW).Height(cmdH).Render(panelTitleStyle.Render(" Commands") + "\n\n" + cmdContent)
+
+		panels = lipgloss.JoinVertical(lipgloss.Left, leftPanel, detailPanel, cmdPanel)
+	} else {
+		// Side-by-side split
+		leftW = contentW * 55 / 100
+		rightW = contentW - leftW - 1
+
+		cmdH = 6
+		detailH = panelH - cmdH - 2
+		if detailH < 5 {
+			detailH = 5
+			panelH = detailH + cmdH + 2
+		}
+		leftH = panelH
+
+		hostContent := m.renderHostList(leftW-4, leftH-4)
+		leftPanel := panelBorder.Width(leftW).Height(leftH).Render(panelTitleStyle.Render(" Hosts") + "\n\n" + hostContent)
+
+		detailContent := m.renderDetails()
+		detailPanel := panelBorder.Width(rightW).Height(detailH).Render(panelTitleStyle.Render(" Server Details") + "\n\n" + detailContent)
+
+		cmdContent := m.renderCommands(rightW - 4)
+		cmdPanel := panelBorder.Width(rightW).Height(cmdH).Render(panelTitleStyle.Render(" Commands") + "\n\n" + cmdContent)
+
+		rightPanel := lipgloss.JoinVertical(lipgloss.Left, detailPanel, cmdPanel)
+		panels = lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
+	}
 
 	view := title + "\n" + searchLine + "\n\n" + panels
 
@@ -309,40 +354,17 @@ func (m model) renderHostList(maxW, maxH int) string {
 	}
 
 	// Column widths — adapt to available space.
-	colAlias := 14
-	colHost := 18
-	colPort := 6
-	colUsers := 6
-	colAuth := 8
-	if maxW > 60 {
-		colAlias = 18
-		colHost = 22
+	available := maxW - 3
+	if available < 10 {
+		available = 10
 	}
-
-	// Header
-	headerStyle := lipgloss.NewStyle().Foreground(subtle).Bold(true)
-	header := fmt.Sprintf("  %-*s %-*s %-*s %-*s %-*s",
-		colAlias, "ALIAS",
-		colHost, "HOST",
-		colPort, "PORT",
-		colUsers, "USERS",
-		colAuth, "AUTH")
-
-	// Separator line stretching full width
-	separatorW := maxW - 2
-	if separatorW < 1 {
-		separatorW = 1
-	}
-	separator := lipgloss.NewStyle().Foreground(subtle).Render(strings.Repeat("─", separatorW))
+	colAlias := available * 40 / 100
+	colHost := available - colAlias
 
 	var b strings.Builder
-	b.WriteString(headerStyle.Render(header))
-	b.WriteByte('\n')
-	b.WriteString(separator)
-	b.WriteByte('\n')
 
 	// Rows
-	visible := maxH - 3 // account for header + separator + possible scroll hint
+	visible := maxH - 1 // account for scroll hint
 	if visible < 1 {
 		visible = 1
 	}
@@ -366,21 +388,16 @@ func (m model) renderHostList(maxW, maxH int) string {
 		}
 
 		alias := truncate(h.Alias, colAlias)
-		hostname := truncate(h.Hostname, colHost)
-		port := fmt.Sprintf("%d", h.Port)
-		userCount := fmt.Sprintf("%d", len(h.AccountNames()))
-		auth := "key"
-		if h.DefaultAuthType == "password" {
-			auth = "pass"
-		}
+		aliasStr := fmt.Sprintf("%-*s", colAlias, alias)
 
-		line := fmt.Sprintf("%s%-*s %-*s %-*s %-*s %-*s",
-			cursor,
-			colAlias, alias,
-			colHost, hostname,
-			colPort, port,
-			colUsers, userCount,
-			colAuth, auth)
+		hostStr := h.Hostname
+		if h.Group != "" {
+			groupTag := lipgloss.NewStyle().Foreground(subtle).Bold(false).Render("[" + h.Group + "]")
+			hostStr += " " + groupTag
+		}
+		hostColStr := lipgloss.NewStyle().Width(colHost).MaxWidth(colHost).Render(hostStr)
+
+		line := fmt.Sprintf("%s%s %s", cursor, aliasStr, hostColStr)
 		b.WriteString(style.Render(line))
 		if i < end-1 {
 			b.WriteByte('\n')
@@ -410,9 +427,18 @@ func (m model) renderDetails() string {
 	}
 	h := m.filtered[m.hostCursor]
 
-	authLabel := "SSH Key"
-	if h.DefaultAuthType == "password" {
-		authLabel = "Password"
+	var users []string
+	for _, account := range h.Accounts {
+		label := account.Username
+		if len(h.Accounts) > 1 && h.DefaultUser == account.Username {
+			label += "*"
+		}
+		if account.AuthType == "password" {
+			label += " (Pass)"
+		} else {
+			label += " (Key)"
+		}
+		users = append(users, label)
 	}
 
 	render := func(label, value string) string {
@@ -422,15 +448,15 @@ func (m model) renderDetails() string {
 	lines := []string{
 		render("Alias", h.Alias),
 		render("Host", h.Hostname),
-		render("Users", strings.Join(h.AccountNames(), ", ")),
+		render("Users", strings.Join(users, ", ")),
 		render("Port", fmt.Sprintf("%d", h.Port)),
-		render("Default Auth", authLabel),
-		render("Overrides", summarizeAccountOverrides(h)),
+		render("Group", h.Group),
+		render("Tags", strings.Join(h.Tags, ", ")),
 	}
 	return strings.Join(lines, "\n")
 }
 
-func (m model) renderCommands() string {
+func (m model) renderCommands(maxW int) string {
 	if m.confirmDelete {
 		return errorStyle.Render("  Press d to confirm delete") + "\n" +
 			hintStyle.Render("  Any other key to cancel")
@@ -443,11 +469,17 @@ func (m model) renderCommands() string {
 		return lipgloss.NewStyle().Width(w).Render(s)
 	}
 
-	col := 16
-	return "  " + pad(cmd("a", "add"), col) + cmd("e", "edit") + "\n" +
-		"  " + pad(cmd("d", "delete"), col) + cmd("⏎", "connect/user") + "\n" +
-		"  " + pad(cmd("/", "search"), col) + cmd("l", "lock") + "\n" +
-		"  " + pad(cmd("q", "quit"), col)
+	col := maxW / 2
+	if col < 12 {
+		col = 12
+	}
+	if col > 25 {
+		col = 25
+	}
+	return "  " + pad(cmd("/", "Search"), col) + cmd("l", "Lock Session") + "\n" +
+		"  " + pad(cmd("a", "Add"), col) + cmd("c", "Change Master Key") + "\n" +
+		"  " + pad(cmd("d", "Delete"), col) + cmd("⏎", "Connect") + "\n" +
+		"  " + pad(cmd("e", "Edit"), col) + cmd("q", "Quit")
 }
 
 func (m model) updateUserSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -506,34 +538,17 @@ func (m model) viewUserSelect() string {
 	return boxStyle.Render(b.String())
 }
 
-func summarizeAccountOverrides(h host.Host) string {
-	var parts []string
-	for _, account := range h.Accounts {
-		if account.UseDefault {
-			continue
-		}
-		label := account.Username + " (SSH Key)"
-		if account.AuthType == "password" {
-			label = account.Username + " (Password)"
-		}
-		parts = append(parts, label)
-	}
-	if len(parts) == 0 {
-		return "None"
-	}
-	return strings.Join(parts, ", ")
-}
-
 func userSummarySuffix(h host.Host, username string) string {
-	account, resolved, ok := h.ResolveAccount(username)
+	_, resolved, ok := h.ResolveAccount(username)
 	if !ok {
 		return ""
 	}
-	if account.UseDefault {
-		return "  [default]"
+	badge := ""
+	if h.DefaultUser == username {
+		badge = " [★ default]"
 	}
 	if resolved.AuthType == "password" {
-		return "  [password override]"
+		return "  [password]" + badge
 	}
-	return "  [key override]"
+	return "  [key]" + badge
 }

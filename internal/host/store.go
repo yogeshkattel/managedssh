@@ -15,12 +15,17 @@ type Host struct {
 	Alias              string     `json:"alias"`
 	Hostname           string     `json:"hostname"`
 	Port               int        `json:"port"`
+	Group              string     `json:"group,omitempty"`
+	Tags               []string   `json:"tags,omitempty"`
+	DefaultUser        string     `json:"default_user,omitempty"`
+	Accounts           []HostUser `json:"accounts,omitempty"`
+
+	// Legacy fields kept for backward compatibility with existing hosts.json.
 	DefaultAuthType    string     `json:"default_auth_type,omitempty"`
 	DefaultEncPassword []byte     `json:"default_enc_password,omitempty"`
 	DefaultKeyPath     string     `json:"default_key_path,omitempty"`
 	DefaultEncKey      []byte     `json:"default_enc_key,omitempty"`
 	DefaultEncKeyPass  []byte     `json:"default_enc_key_pass,omitempty"`
-	Accounts           []HostUser `json:"accounts,omitempty"`
 
 	// Legacy fields kept for backward compatibility with existing hosts.json.
 	User        string   `json:"user,omitempty"`
@@ -136,8 +141,11 @@ func (s *Store) Filter(query string) []Host {
 	var out []Host
 	for _, h := range s.Hosts {
 		users := strings.ToLower(strings.Join(h.AccountNames(), " "))
+		tags := strings.ToLower(strings.Join(h.Tags, " "))
 		if strings.Contains(strings.ToLower(h.Alias), q) ||
 			strings.Contains(strings.ToLower(h.Hostname), q) ||
+			strings.Contains(strings.ToLower(h.Group), q) ||
+			strings.Contains(tags, q) ||
 			strings.Contains(users, q) {
 			out = append(out, h)
 		}
@@ -179,9 +187,36 @@ func (h *Host) Normalize() {
 			})
 		}
 	}
+	for i := range accounts {
+		if accounts[i].UseDefault || accounts[i].AuthType == "" {
+			accounts[i].UseDefault = false
+			accounts[i].AuthType = h.DefaultAuthType
+			if accounts[i].AuthType == "" {
+				accounts[i].AuthType = "key"
+			}
+			accounts[i].EncPassword = cloneBytes(h.DefaultEncPassword)
+			accounts[i].KeyPath = h.DefaultKeyPath
+			accounts[i].EncKey = cloneBytes(h.DefaultEncKey)
+			accounts[i].EncKeyPass = cloneBytes(h.DefaultEncKeyPass)
+		}
+	}
 	h.Accounts = accounts
 
 	names := h.AccountNames()
+	if h.DefaultUser == "" && len(names) > 0 {
+		h.DefaultUser = names[0]
+	} else if h.DefaultUser != "" {
+		found := false
+		for _, n := range names {
+			if n == h.DefaultUser { found = true; break }
+		}
+		if !found && len(names) > 0 {
+			h.DefaultUser = names[0]
+		} else if !found {
+			h.DefaultUser = ""
+		}
+	}
+
 	h.User = ""
 	if len(names) > 0 {
 		h.User = names[0]
